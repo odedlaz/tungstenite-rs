@@ -1,4 +1,4 @@
-# UNRELEASED
+# 0.30.0
 
 * Reject non-compliant clients (incorrect `Sec-WebSocket-Key` length/format) on the server side.
 * Update `rand` and `sha` dependencies and raise MSRV to 1.85.
