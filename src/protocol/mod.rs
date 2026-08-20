@@ -188,15 +188,23 @@ impl<Stream> WebSocket<Stream> {
     }
 
     /// Convert a raw socket into a WebSocket without performing a handshake.
-    pub fn from_raw_socket_with_extensions(
+    ///
+    /// Where [`WebSocket::from_raw_socket`] infers the enabled extensions from
+    /// the [`WebSocketConfig`], this takes the ones the handshake negotiated.
+    ///
+    /// # Panics
+    /// Panics if config is invalid e.g. `max_write_buffer_size <= write_buffer_size`.
+    #[cfg(feature = "handshake")]
+    pub(crate) fn from_raw_socket_with_extensions(
         stream: Stream,
         role: Role,
         config: Option<WebSocketConfig>,
         extensions: Extensions,
     ) -> Self {
-        let mut context = WebSocketContext::new(role, config);
-        context.extensions = extensions;
-        WebSocket { socket: stream, context }
+        WebSocket {
+            socket: stream,
+            context: WebSocketContext::new_with_extensions(role, config, extensions),
+        }
     }
 
     /// Convert a raw socket into a WebSocket without performing a handshake.
@@ -424,6 +432,23 @@ impl WebSocketContext {
             conf,
             conf.extensions.into_unnegotiated_context(role),
         )
+    }
+
+    /// Create a WebSocket context for a post-handshake stream with the enabled extensions.
+    ///
+    /// Where [`WebSocketContext::new`] infers the enabled extensions from the
+    /// [`WebSocketConfig`], this takes the ones the handshake negotiated.
+    ///
+    /// # Panics
+    /// Panics if config is invalid e.g. `max_write_buffer_size <= write_buffer_size`.
+    #[cfg(feature = "handshake")]
+    pub(crate) fn new_with_extensions(
+        role: Role,
+        config: Option<WebSocketConfig>,
+        extensions: Extensions,
+    ) -> Self {
+        let conf = config.unwrap_or_default();
+        Self::_new(role, FrameCodec::new(conf.read_buffer_size), conf, extensions)
     }
 
     /// Create a WebSocket context that manages a post-handshake stream.
