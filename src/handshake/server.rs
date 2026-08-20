@@ -6,6 +6,7 @@ use std::{
     result::Result as StdResult,
 };
 
+#[cfg(feature = "deflate")]
 use headers::{Header, HeaderMapExt};
 use http::{
     header::HeaderValue, response::Builder, HeaderMap, Request as HttpRequest,
@@ -20,9 +21,11 @@ use super::{
     machine::{HandshakeMachine, StageResult, TryParse},
     HandshakeRole, MidHandshake, ProcessingResult,
 };
+#[cfg(feature = "deflate")]
+use crate::extensions::headers::SecWebsocketExtensions;
 use crate::{
     error::{Error, ProtocolError, Result},
-    extensions::{headers::SecWebsocketExtensions, Extensions},
+    extensions::Extensions,
     handshake::version_as_str,
     protocol::{Role, WebSocket, WebSocketConfig},
 };
@@ -263,7 +266,12 @@ impl<S: Read + Write, C: Callback> HandshakeRole for ServerHandshake<S, C> {
                     return Err(Error::Protocol(ProtocolError::JunkAfterRequest));
                 }
 
+                #[allow(unused_mut)]
                 let mut response = create_response(&result)?;
+                // With no PMCE compiled in there is nothing to negotiate, so
+                // the header is not parsed at all — upstream ignores it, and
+                // RFC 6455 §9.1 permits that.
+                #[cfg(feature = "deflate")]
                 if let Some(extensions) =
                     result.headers().typed_try_get::<SecWebsocketExtensions>().map_err(|_| {
                         ProtocolError::InvalidHeader(SecWebsocketExtensions::name().clone().into())
@@ -413,6 +421,48 @@ mod tests {
             !response.contains("sec-websocket-extensions"),
             "declined offer must not be echoed: {response}"
         );
+    }
+
+    #[test]
+    fn bare_accept_ignores_any_extensions_header() {
+        // With no PMCE compiled in, the header is not parsed at all, so no wire
+        // form of it can fail a handshake that upstream would complete. Includes
+        // a quoted value and outright garbage for that reason.
+        for offer in [
+            "permessage-deflate; client_max_window_bits",
+            "permessage-deflate; server_max_window_bits=\"10\"",
+            "permessage-deflate; client_max_window_bits=8",
+            "permessage-deflate; unknown_param=whatever",
+            "permessage-deflate, permessage-deflate; server_no_context_takeover",
+            "foo, bar; baz=2",
+            "x-webkit-deflate-frame",
+            ";;;",
+            "=",
+        ] {
+            let request = format!(
+                "GET /script.ws HTTP/1.1\r\n\
+                 Host: foo.com\r\n\
+                 Connection: upgrade\r\n\
+                 Upgrade: websocket\r\n\
+                 Sec-WebSocket-Version: 13\r\n\
+                 Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+                 Sec-WebSocket-Extensions: {offer}\r\n\
+                 \r\n"
+            );
+            let stream = MockStream {
+                read: std::io::Cursor::new(request.into_bytes()),
+                written: Vec::new(),
+            };
+
+            let socket = crate::accept(stream)
+                .unwrap_or_else(|e| panic!("offer {offer:?} must not fail the handshake: {e}"));
+            let response = String::from_utf8_lossy(&socket.get_ref().written).to_ascii_lowercase();
+            assert!(response.contains("101 switching protocols"), "offer {offer:?}: {response}");
+            assert!(
+                !response.contains("sec-websocket-extensions"),
+                "offer {offer:?} must not be echoed: {response}"
+            );
+        }
     }
 
     #[test]

@@ -7,7 +7,7 @@ use thiserror::Error;
 use crate::extensions::compression::{
     CompressionError, DecompressionError, PerMessageCompressionContext,
 };
-#[cfg(feature = "handshake")]
+#[cfg(feature = "deflate")]
 use crate::extensions::headers::{SecWebsocketExtensions, WebsocketProtocolExtension};
 use crate::protocol::Role;
 
@@ -49,7 +49,7 @@ pub enum ExtensionsError {
     MalformedExtension(&'static str),
 }
 
-#[cfg(feature = "handshake")]
+#[cfg(feature = "deflate")]
 impl ExtensionsConfig {
     pub(crate) fn generate_offers(&self) -> impl Iterator<Item = WebsocketProtocolExtension> {
         let Self {
@@ -262,7 +262,7 @@ impl Extensions {
     }
 }
 
-#[cfg(feature = "handshake")]
+#[cfg(feature = "deflate")]
 #[cfg(test)]
 mod test {
     use super::*;
