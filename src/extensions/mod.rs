@@ -155,40 +155,16 @@ impl ExtensionsConfig {
                     {
                         Ok(extension) => extension,
                         Err(e) => {
-                            // Per RFC 7692 Section 7:
-                            //
-                            //  A server MUST decline an extension negotiation
-                            //  offer for this extension if any of the following
-                            //  conditions are met:
-                            //
-                            //   o  The negotiation offer contains an extension
-                            //   parameter not defined for use in an offer.
-                            //
-                            // Declining instead of rejecting the request
-                            // outright allows clients that conform to a
-                            // (currently hypothetical) RFC that supersedes RFC
-                            // 7692 to fall back to requesting to the behavior
-                            // specified in the latter.
+                            // Decline this offer rather than reject the whole
+                            // request, so a client offering some future PMCE can
+                            // still fall back to RFC 7692. §7 requires declining
+                            // an offer carrying an undefined parameter.
                             log::debug!("{EXTENSION_NAME} extension: {e}");
                             continue;
                         }
                     };
-                    // Per RFC 7692 Section 5:
-                    //
-                    //   A client may also offer multiple PMCE choices to the server
-                    //   by including multiple elements in the
-                    //   "Sec-WebSocket-Extensions" header, one for each PMCE
-                    //   offered.  This set of elements MAY include multiple PMCEs
-                    //   with the same extension name to offer the possibility to
-                    //   use the same algorithm with different configuration
-                    //   parameters.  The order of elements is important as it
-                    //   specifies the client's preference.  An element preceding
-                    //   another element has higher preference.  It is recommended
-                    //   that a server accepts PMCEs with higher preference if the
-                    //   server supports them.
-                    //
-                    // Follow the RFC recommendation by not overwriting a PMCE that
-                    // is already configured.
+                    // Offers arrive in the client's preference order, so keep
+                    // the first one that matched. RFC 7692 §5.
                     if per_message_compression.is_some() {
                         continue;
                     }
