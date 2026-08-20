@@ -32,6 +32,7 @@ pub enum CompressionError {
 
 #[derive(Debug, Error)]
 #[cfg_attr(test, derive(PartialEq))]
+#[cfg_attr(not(feature = "deflate"), allow(dead_code))]
 pub(crate) enum DecompressionError<E = CompressionError> {
     /// The decompressed frame is larger than the configured limit.
     #[error("decompressed data is too large")]
@@ -80,6 +81,7 @@ pub(crate) fn decompress(
 }
 
 impl<E> DecompressionError<E> {
+    #[cfg_attr(not(feature = "deflate"), allow(dead_code))]
     pub(crate) fn map<T>(self, f: impl FnOnce(E) -> T) -> DecompressionError<T> {
         match self {
             Self::SizeLimitReached => DecompressionError::SizeLimitReached,
