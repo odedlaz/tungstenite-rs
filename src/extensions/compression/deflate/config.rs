@@ -742,7 +742,7 @@ mod test {
             MODIFIERS
                 .iter()
                 .enumerate()
-                .filter(|(i, _)| (selector & (1 << i) != 0))
+                .filter(|(i, _)| selector & (1 << i) != 0)
                 .fold(DeflateConfig::new(), |config, (_, modifier)| modifier(config))
         }
 

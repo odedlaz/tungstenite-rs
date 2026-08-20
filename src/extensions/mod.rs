@@ -112,7 +112,7 @@ impl ExtensionsConfig {
                     })?;
 
                     per_message_compression =
-                        Some(DeflateContext::new(Role::Client, deflate_config).into());
+                        Some(DeflateContext::new(Role::Client, deflate_config));
                 }
                 name => return Err(ExtensionsError::InvalidExtension(name.into())),
             }
@@ -170,10 +170,8 @@ impl ExtensionsConfig {
                     }
 
                     if let Some((config, response)) = deflate.accept_offer(extension) {
-                        per_message_compression = Some((
-                            DeflateContext::new(Role::Server, config).into(),
-                            response.into(),
-                        ));
+                        per_message_compression =
+                            Some((DeflateContext::new(Role::Server, config), response.into()));
                     }
                 }
                 // Ignore any unknown extensions in the offer.
@@ -214,7 +212,7 @@ impl ExtensionsConfig {
         #[cfg(feature = "deflate")]
         {
             per_message_compression = permessage_deflate
-                .map(|deflate| compression::deflate::DeflateContext::new(role, deflate).into());
+                .map(|deflate| compression::deflate::DeflateContext::new(role, deflate));
         }
         let _ = role;
 
@@ -236,7 +234,9 @@ impl Extensions {
     ) -> Option<impl FnOnce(&Bytes) -> Result<Bytes, CompressionError> + 's> {
         let Self { per_message_compression } = self;
 
-        per_message_compression.as_mut().map(PerMessageCompressionContext::compressor)
+        per_message_compression
+            .as_mut()
+            .map(|context| move |payload: &Bytes| compression::compress(context, payload))
     }
 
     /// Returns a function that, if present, decompresses a frame payload.
@@ -254,7 +254,11 @@ impl Extensions {
         &'s mut self,
     ) -> Option<impl FnMut(&Bytes, bool, usize) -> Result<Bytes, DecompressionError> + 's> {
         let Self { per_message_compression } = self;
-        per_message_compression.as_mut().map(PerMessageCompressionContext::decompressor)
+        per_message_compression.as_mut().map(|context| {
+            move |payload: &Bytes, is_final, size_limit| {
+                compression::decompress(context, payload, is_final, size_limit)
+            }
+        })
     }
 }
 
@@ -352,7 +356,7 @@ mod test {
             ]))
             .unwrap();
 
-        assert!(matches!(per_message_compression, Some(PerMessageCompressionContext::Deflate(_))));
+        assert!(per_message_compression.is_some());
         assert_eq!(
             response,
             Some(SecWebsocketExtensions::new([DeflateConfig::new()

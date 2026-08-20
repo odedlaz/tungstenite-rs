@@ -318,12 +318,6 @@ impl DeflateDecompress {
     }
 }
 
-impl From<DeflateContext> for super::PerMessageCompressionContext {
-    fn from(value: DeflateContext) -> Self {
-        Self::Deflate(value)
-    }
-}
-
 #[cfg(test)]
 pub(crate) mod test {
     use rand::{distr::Distribution as _, Rng as _, SeedableRng as _};

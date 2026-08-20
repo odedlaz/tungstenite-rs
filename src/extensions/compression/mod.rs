@@ -9,13 +9,17 @@ use thiserror::Error;
 pub mod deflate;
 
 /// Active context for performing per-message compression.
-#[derive(Debug)]
-#[cfg_attr(not(feature = "deflate"), allow(missing_copy_implementations))] // This is only trivially copyable if compression is disabled.
-pub enum PerMessageCompressionContext {
-    /// Context for compressing/decompressing with `permessage-deflate`.
-    #[cfg(feature = "deflate")]
-    Deflate(deflate::DeflateContext),
-}
+///
+/// Uninhabited when no PMCE is compiled in, so [`Extensions`] can hold the
+/// field unconditionally and the `None` case needs no special handling.
+///
+/// [`Extensions`]: crate::extensions::Extensions
+#[cfg(feature = "deflate")]
+pub type PerMessageCompressionContext = deflate::DeflateContext;
+
+/// Active context for performing per-message compression.
+#[cfg(not(feature = "deflate"))]
+pub type PerMessageCompressionContext = core::convert::Infallible;
 
 /// Error encountered while compressing or decompressing.
 #[derive(Copy, Clone, Debug, Error, PartialEq, Eq)]
@@ -37,40 +41,42 @@ pub(crate) enum DecompressionError<E = CompressionError> {
     Decompression(E),
 }
 
-impl PerMessageCompressionContext {
-    #[inline]
-    pub(crate) fn compressor<'s>(
-        &'s mut self,
-    ) -> impl FnMut(&Bytes) -> Result<Bytes, CompressionError> + 's {
-        move |payload: &Bytes| match self {
-            #[cfg(feature = "deflate")]
-            Self::Deflate(deflate_config) => {
-                deflate_config.compress(payload).map_err(CompressionError::Deflate)
-            }
-            #[cfg(not(feature = "deflate"))]
-            _ => {
-                let _ = payload;
-                unreachable!("*PerMessageCompressionContext is uninhabited")
-            }
-        }
-    }
+#[cfg(feature = "deflate")]
+#[inline]
+pub(crate) fn compress(
+    context: &mut PerMessageCompressionContext,
+    payload: &Bytes,
+) -> Result<Bytes, CompressionError> {
+    context.compress(payload).map_err(CompressionError::Deflate)
+}
 
-    #[inline]
-    pub(crate) fn decompressor<'s>(
-        &'s mut self,
-    ) -> impl FnMut(&Bytes, bool, usize) -> Result<Bytes, DecompressionError> + 's {
-        move |payload, is_final, size_limit| match self {
-            #[cfg(feature = "deflate")]
-            Self::Deflate(deflate_config) => deflate_config
-                .decompress(payload, is_final, size_limit)
-                .map_err(|e| e.map(CompressionError::Deflate)),
-            #[cfg(not(feature = "deflate"))]
-            _ => {
-                let _ = (payload, is_final, size_limit);
-                unreachable!("*PerMessageCompressionContext is uninhabited")
-            }
-        }
-    }
+#[cfg(feature = "deflate")]
+#[inline]
+pub(crate) fn decompress(
+    context: &mut PerMessageCompressionContext,
+    payload: &Bytes,
+    is_final: bool,
+    size_limit: usize,
+) -> Result<Bytes, DecompressionError> {
+    context.decompress(payload, is_final, size_limit).map_err(|e| e.map(CompressionError::Deflate))
+}
+
+#[cfg(not(feature = "deflate"))]
+pub(crate) fn compress(
+    context: &mut PerMessageCompressionContext,
+    _payload: &Bytes,
+) -> Result<Bytes, CompressionError> {
+    match *context {}
+}
+
+#[cfg(not(feature = "deflate"))]
+pub(crate) fn decompress(
+    context: &mut PerMessageCompressionContext,
+    _payload: &Bytes,
+    _is_final: bool,
+    _size_limit: usize,
+) -> Result<Bytes, DecompressionError> {
+    match *context {}
 }
 
 impl<E> DecompressionError<E> {
