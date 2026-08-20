@@ -7,6 +7,8 @@ use thiserror::Error;
 
 use crate::{extensions::compression::DecompressionError, protocol::Role};
 
+use self::config::SUPPORTED_WINDOW_BITS;
+
 mod config;
 #[cfg_attr(not(feature = "handshake"), allow(unused_imports))]
 pub(crate) use config::ParameterError as DeflateParameterError;
@@ -93,9 +95,13 @@ impl DeflateContext {
             },
             decompress: DeflateDecompress {
                 peer_context_takeover: !peer_no_context_takeover,
+                // A peer may legally compress with an 8-bit window, which
+                // `Decompress::new_with_window_bits` panics on. Inflating with a
+                // larger window than the sender used is always correct, so raise
+                // it to the smallest flate2 accepts.
                 decompressor: Decompress::new_with_window_bits(
                     false,
-                    decompressor_window_bits.get(),
+                    decompressor_window_bits.get().max(SUPPORTED_WINDOW_BITS.start().get()),
                 ),
             },
         }
