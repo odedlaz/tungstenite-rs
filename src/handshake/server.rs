@@ -269,14 +269,11 @@ impl<S: Read + Write, C: Callback> HandshakeRole for ServerHandshake<S, C> {
                         ProtocolError::InvalidHeader(SecWebsocketExtensions::name().clone().into())
                     })?
                 {
-                    let extensions_config = self
-                        .config
-                        .ok_or_else(|| {
-                            ProtocolError::InvalidHeader(
-                                SecWebsocketExtensions::name().clone().into(),
-                            )
-                        })?
-                        .extensions;
+                    // `None` means defaults here as everywhere else in the
+                    // crate — `accept()` passes it — and the default config
+                    // declines every offer, which RFC 6455 §9.1 permits.
+                    let extensions_config =
+                        self.config.map(|config| config.extensions).unwrap_or_default();
                     let (extensions, agreed) = extensions_config
                         .accept_offers(&extensions)
                         .map_err(ProtocolError::from)?;
@@ -367,6 +364,55 @@ mod tests {
         let req = request_with_key(key);
         let err = create_response(&req).unwrap_err();
         assert!(matches!(err, Error::Protocol(ProtocolError::InvalidSecWebSocketKey)));
+    }
+
+    /// A duplex over a fixed request, so `accept` can be driven without a socket.
+    struct MockStream {
+        read: std::io::Cursor<Vec<u8>>,
+        written: Vec<u8>,
+    }
+
+    impl std::io::Read for MockStream {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            std::io::Read::read(&mut self.read, buf)
+        }
+    }
+
+    impl std::io::Write for MockStream {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.written.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn bare_accept_ignores_offered_extensions() {
+        // Every mainstream browser offers `permessage-deflate`, and `accept()`
+        // passes `config: None`. Everywhere else in the crate that means "use
+        // defaults", and RFC 6455 §9.1 lets a server ignore an offer it does
+        // not support, so this handshake must succeed with nothing negotiated.
+        let request = b"\
+            GET /script.ws HTTP/1.1\r\n\
+            Host: foo.com\r\n\
+            Connection: upgrade\r\n\
+            Upgrade: websocket\r\n\
+            Sec-WebSocket-Version: 13\r\n\
+            Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+            Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits\r\n\
+            \r\n";
+        let stream =
+            MockStream { read: std::io::Cursor::new(request.to_vec()), written: Vec::new() };
+
+        let socket = crate::accept(stream).expect("bare accept() must not reject an offer");
+        let response = String::from_utf8_lossy(&socket.get_ref().written).to_ascii_lowercase();
+        assert!(response.contains("101 switching protocols"), "response was: {response}");
+        assert!(
+            !response.contains("sec-websocket-extensions"),
+            "declined offer must not be echoed: {response}"
+        );
     }
 
     #[test]
