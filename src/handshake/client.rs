@@ -302,14 +302,15 @@ impl VerifyData {
                     ProtocolError::InvalidHeader(SecWebsocketExtensions::name().clone().into())
                 })?;
 
-            match extensions_header {
-                None => Extensions::default(),
-                Some(agreed) => extensions
-                    .ok_or(ProtocolError::InvalidHeader(
-                        SecWebsocketExtensions::name().clone().into(),
-                    ))?
-                    .verify_agreed_on(agreed)
-                    .map_err(ProtocolError::from)?,
+            match (extensions_header, extensions) {
+                (Some(agreed), Some(config)) => {
+                    config.verify_agreed_on(agreed).map_err(ProtocolError::from)?
+                }
+                // Either the server echoed nothing, or we offered nothing
+                // through the config and the caller wrote the request header by
+                // hand — upstream ignored the echo rather than failing, and
+                // there is no agreement of ours to check it against.
+                _ => Extensions::default(),
             }
         };
         #[cfg(not(feature = "deflate"))]
@@ -391,6 +392,59 @@ pub fn generate_key() -> String {
 mod tests {
     use super::{super::machine::TryParse, generate_key, generate_request, Response};
     use crate::client::IntoClientRequest;
+
+    #[cfg(feature = "deflate")]
+    #[test]
+    fn response_extensions_without_config_are_ignored() {
+        // Mirror of the server-side config-`None` defect: a client that offers
+        // an extension by hand has no `ExtensionsConfig`, and upstream ignored
+        // the server's echo. Treating `None` as an error kills the handshake.
+        use super::VerifyData;
+
+        let key = "dGhlIHNhbXBsZSBub25jZQ==";
+        let accept = crate::handshake::derive_accept_key(key.as_bytes());
+        let verify = VerifyData { accept_key: accept.clone(), subprotocols: None };
+
+        let response = http::Response::builder()
+            .status(101)
+            .header("Connection", "Upgrade")
+            .header("Upgrade", "websocket")
+            .header("Sec-WebSocket-Accept", accept)
+            .header("Sec-WebSocket-Extensions", "x-custom-extension")
+            .body(None)
+            .unwrap();
+
+        verify.verify_response(response, None).expect("a manual offer must not be fatal");
+    }
+
+    #[cfg(feature = "deflate")]
+    #[test]
+    fn response_extension_outside_the_config_is_rejected() {
+        // Pinning the half of this that is a design question rather than a
+        // defect: once a config exists, it is treated as the whole offer, so an
+        // extension the caller added to the request by hand is not recognised
+        // and its echo fails the handshake. RFC 6455 §4.1 keys this on what the
+        // client's handshake contained, which only the request headers know —
+        // so honouring both would mean threading them into `VerifyData`.
+        use super::VerifyData;
+        use crate::extensions::{compression::deflate::DeflateConfig, ExtensionsConfig};
+
+        let key = "dGhlIHNhbXBsZSBub25jZQ==";
+        let accept = crate::handshake::derive_accept_key(key.as_bytes());
+        let verify = VerifyData { accept_key: accept.clone(), subprotocols: None };
+        let config = ExtensionsConfig { permessage_deflate: Some(DeflateConfig::default()) };
+
+        let response = http::Response::builder()
+            .status(101)
+            .header("Connection", "Upgrade")
+            .header("Upgrade", "websocket")
+            .header("Sec-WebSocket-Accept", accept)
+            .header("Sec-WebSocket-Extensions", "x-hand-written-extension")
+            .body(None)
+            .unwrap();
+
+        assert!(verify.verify_response(response, Some(&config)).is_err());
+    }
 
     #[test]
     fn random_keys() {
