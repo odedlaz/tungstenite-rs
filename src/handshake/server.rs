@@ -266,7 +266,7 @@ impl<S: Read + Write, C: Callback> HandshakeRole for ServerHandshake<S, C> {
                     return Err(Error::Protocol(ProtocolError::JunkAfterRequest));
                 }
 
-                #[allow(unused_mut)]
+                #[cfg_attr(not(feature = "deflate"), allow(unused_mut))]
                 let mut response = create_response(&result)?;
                 // With no PMCE compiled in there is nothing to negotiate, so
                 // the header is not parsed at all — upstream ignores it, and
@@ -396,40 +396,51 @@ mod tests {
         }
     }
 
+    /// Drives a bare `accept()` against a request carrying `offer`, and asserts
+    /// the handshake completes with nothing echoed back.
+    fn assert_bare_accept_ignores(offer: &str) {
+        let request = format!(
+            "GET /script.ws HTTP/1.1\r\n\
+             Host: foo.com\r\n\
+             Connection: upgrade\r\n\
+             Upgrade: websocket\r\n\
+             Sec-WebSocket-Version: 13\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+             Sec-WebSocket-Extensions: {offer}\r\n\
+             \r\n"
+        );
+        let stream =
+            MockStream { read: std::io::Cursor::new(request.into_bytes()), written: Vec::new() };
+
+        let socket = crate::accept(stream)
+            .unwrap_or_else(|e| panic!("offer {offer:?} must not fail the handshake: {e}"));
+        let response = String::from_utf8_lossy(&socket.get_ref().written).to_ascii_lowercase();
+        assert!(response.contains("101 switching protocols"), "offer {offer:?}: {response}");
+        assert!(
+            !response.contains("sec-websocket-extensions"),
+            "offer {offer:?} must not be echoed: {response}"
+        );
+    }
+
     #[test]
     fn bare_accept_ignores_offered_extensions() {
         // Every mainstream browser offers `permessage-deflate`, and `accept()`
         // passes `config: None`. Everywhere else in the crate that means "use
         // defaults", and RFC 6455 §9.1 lets a server ignore an offer it does
         // not support, so this handshake must succeed with nothing negotiated.
-        let request = b"\
-            GET /script.ws HTTP/1.1\r\n\
-            Host: foo.com\r\n\
-            Connection: upgrade\r\n\
-            Upgrade: websocket\r\n\
-            Sec-WebSocket-Version: 13\r\n\
-            Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
-            Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits\r\n\
-            \r\n";
-        let stream =
-            MockStream { read: std::io::Cursor::new(request.to_vec()), written: Vec::new() };
-
-        let socket = crate::accept(stream).expect("bare accept() must not reject an offer");
-        let response = String::from_utf8_lossy(&socket.get_ref().written).to_ascii_lowercase();
-        assert!(response.contains("101 switching protocols"), "response was: {response}");
-        assert!(
-            !response.contains("sec-websocket-extensions"),
-            "declined offer must not be echoed: {response}"
-        );
+        assert_bare_accept_ignores("permessage-deflate; client_max_window_bits");
     }
 
     #[test]
     fn bare_accept_ignores_any_extensions_header() {
-        // With no PMCE compiled in, the header is not parsed at all, so no wire
-        // form of it can fail a handshake that upstream would complete. Includes
-        // a quoted value and outright garbage for that reason.
+        // A bare `accept()` completes for every one of these in both builds,
+        // for two different reasons: with no PMCE compiled in the header is not
+        // parsed at all, and with one compiled in the default `ExtensionsConfig`
+        // has no `permessage_deflate`, so every offer is declined without an
+        // echo. Either way no wire form can fail a handshake upstream would
+        // complete — hence the quoted value and the garbage. The plain browser
+        // offer has its own test above.
         for offer in [
-            "permessage-deflate; client_max_window_bits",
             "permessage-deflate; server_max_window_bits=\"10\"",
             "permessage-deflate; client_max_window_bits=8",
             "permessage-deflate; unknown_param=whatever",
@@ -439,29 +450,7 @@ mod tests {
             ";;;",
             "=",
         ] {
-            let request = format!(
-                "GET /script.ws HTTP/1.1\r\n\
-                 Host: foo.com\r\n\
-                 Connection: upgrade\r\n\
-                 Upgrade: websocket\r\n\
-                 Sec-WebSocket-Version: 13\r\n\
-                 Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
-                 Sec-WebSocket-Extensions: {offer}\r\n\
-                 \r\n"
-            );
-            let stream = MockStream {
-                read: std::io::Cursor::new(request.into_bytes()),
-                written: Vec::new(),
-            };
-
-            let socket = crate::accept(stream)
-                .unwrap_or_else(|e| panic!("offer {offer:?} must not fail the handshake: {e}"));
-            let response = String::from_utf8_lossy(&socket.get_ref().written).to_ascii_lowercase();
-            assert!(response.contains("101 switching protocols"), "offer {offer:?}: {response}");
-            assert!(
-                !response.contains("sec-websocket-extensions"),
-                "offer {offer:?} must not be echoed: {response}"
-            );
+            assert_bare_accept_ignores(offer);
         }
     }
 

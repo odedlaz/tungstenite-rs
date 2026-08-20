@@ -423,9 +423,10 @@ mod tests {
     #[cfg(feature = "deflate")]
     #[test]
     fn response_extension_echoing_a_manual_offer_is_ignored() {
-        // Mirror of the server-side config-`None` defect: a client that offers
-        // an extension by hand has no `ExtensionsConfig`, and upstream ignored
-        // the server's echo. Treating `None` as an error kills the handshake.
+        // Mirror of the server-side config-`None` case: a client doing manual
+        // negotiation has no `ExtensionsConfig`, so there is no agreement of
+        // ours to check the echo against. Upstream ignores it, and treating the
+        // absent config as an error instead would kill the handshake.
         use super::VerifyData;
 
         let key = "dGhlIHNhbXBsZSBub25jZQ==";
@@ -522,7 +523,11 @@ mod tests {
         // client's handshake contained, which only the request headers know —
         // so honouring both would mean threading them into `VerifyData`.
         use super::VerifyData;
-        use crate::extensions::{compression::deflate::DeflateConfig, ExtensionsConfig};
+        use crate::{
+            error::ProtocolError,
+            extensions::{compression::deflate::DeflateConfig, ExtensionsConfig, ExtensionsError},
+            Error,
+        };
 
         let key = "dGhlIHNhbXBsZSBub25jZQ==";
         let accept = crate::handshake::derive_accept_key(key.as_bytes());
@@ -542,7 +547,17 @@ mod tests {
             .body(None)
             .unwrap();
 
-        assert!(verify.verify_response(response, Some(&config)).is_err());
+        let err = verify
+            .verify_response(response, Some(&config))
+            .expect_err("an extension outside the config is not an agreement");
+        assert!(
+            matches!(
+                &err,
+                Error::Protocol(ProtocolError::InvalidExtensionsHeader(e))
+                    if **e == ExtensionsError::InvalidExtension("x-hand-written-extension".into())
+            ),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[test]
