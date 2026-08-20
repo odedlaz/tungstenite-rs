@@ -62,9 +62,6 @@ pub enum NegotiationError {
     /// Missing `server_no_context_takeover` value in a negotiation response.
     #[error("Missing {SERVER_NO_CONTEXT_TAKEOVER} value in a negotiation response")]
     MissingServerNoContextTakeover,
-    /// The `server_max_window_bits` value in a negotiation response is not in [`SUPPORTED_WINDOW_BITS`].
-    #[error("Unsupported {SERVER_MAX_WINDOW_BITS} value")]
-    UnsupportedServerMaxWindowBitsValue(u8),
     /// The `client_max_window_bits` value in a negotiation response is not in [`SUPPORTED_WINDOW_BITS`].
     #[error("Unsupported {CLIENT_MAX_WINDOW_BITS} value")]
     UnsupportedClientMaxWindowBitsValue(u8),
@@ -153,9 +150,18 @@ pub struct DeflateConfig {
     /// If set, indicates that client compression of a subsequent message won't
     /// reuse the context window of the previous one.
     pub client_no_context_takeover: bool,
-    /// Guaranteed to be in the range [`SUPPORTED_WINDOW_BITS`].
+    // Both windows are in `ALLOWED_WINDOW_BITS`, and whichever of the two is
+    // *this* end's — `server_` for a server, `client_` for a client — is
+    // further in `SUPPORTED_WINDOW_BITS`, because flate2 cannot deflate with an
+    // 8-bit window. The other is the peer's and is only ever inflated with,
+    // where a window at least as large as the sender's is always correct, so
+    // `DeflateContext::new` raises it to the smallest flate2 accepts. Each
+    // negotiation path asserts its own half: `accept_offer` for a server,
+    // `accept_response` for a client. A `DeflateConfig` does not carry its
+    // role, so this cannot be stated per field.
+    /// The window the server compresses with. In `ALLOWED_WINDOW_BITS`.
     server_max_window_bits: NonZeroU8,
-    /// Guaranteed to be in the range [`SUPPORTED_WINDOW_BITS`].
+    /// The window the client compresses with. In `ALLOWED_WINDOW_BITS`.
     client_max_window_bits: NonZeroU8,
 }
 
@@ -344,12 +350,19 @@ impl DeflateConfig {
                 // The client supports the parameter so we can use our configured value.
                 client_max_window_bits
             }
-            // No lower bound: this caps the *client's* compressor, and the
-            // server only inflates with it. `DeflateContext::new` raises the
-            // inflate window to what flate2 accepts, so 8 costs nothing —
-            // declining it merely forfeited compression on a legal offer.
+            // No lower bound: this caps the *client's* compressor and the
+            // server only inflates with it, which is correct at any window at
+            // least as large — `DeflateContext::new` raises the inflate window
+            // to the smallest flate2 accepts, so 8 costs nothing to accept.
             ClientMaxWindowBits::Bits(client_max) => client_max.min(client_max_window_bits),
         };
+
+        // Mirror of the pair in `accept_response`, with the roles swapped:
+        // `server_max_window_bits` is our own compressor here and has to be one
+        // we can deflate with, `client_max_window_bits` is the peer's and any
+        // legal value is fine.
+        debug_assert!(SUPPORTED_WINDOW_BITS.contains(&server_max_window_bits));
+        debug_assert!(ALLOWED_WINDOW_BITS.contains(&client_max_window_bits));
 
         let connection_config = DeflateConfig {
             compression,
@@ -421,11 +434,11 @@ impl DeflateConfig {
                 return Err(NegotiationError::InvalidServerMaxWindowBitsValue(received.get()));
             }
 
-            // No lower bound: this value constrains the *server's* compressor,
-            // and we only inflate with it. `DeflateContext::new` raises the
-            // inflate window to what flate2 accepts. Clamping here instead
-            // would be wrong — the response echoes the negotiated value, and
-            // §7.1.2.2 requires it be equal to or smaller than the offer.
+            // No lower bound: this value is the *server's* compressor window
+            // and we only inflate with it, which is correct at any window at
+            // least as large — `DeflateContext::new` raises it to the smallest
+            // flate2 accepts. Recording it unclamped keeps this equal to what
+            // was negotiated, which is what RFC 7692 §7.1.2.1 defines.
             received
         };
 
@@ -694,7 +707,8 @@ mod test {
             .expect("8 is a legal server window");
         assert_eq!(agreed.server_max_window_bits().get(), 8);
 
-        // Must not panic: this is the constructor the old check was shielding.
+        // Must not panic: `Decompress::new_with_window_bits` rejects 8, so the
+        // clamp in `DeflateContext::new` is what makes this constructible.
         let mut us =
             crate::extensions::compression::deflate::DeflateContext::new(Role::Client, agreed);
 
@@ -747,7 +761,7 @@ mod test {
         let mut peer =
             crate::extensions::compression::deflate::DeflateContext::new(Role::Client, peer_config);
 
-        let payload = bytes::Bytes::from_static(b"a legal offer we used to throw away entirely");
+        let payload = bytes::Bytes::from_static(b"round-trips across an 8-bit peer window");
         let compressed = peer.compress(&payload).expect("client compresses");
         let inflated = us.decompress(&compressed, true, usize::MAX).expect("server inflates");
         assert_eq!(&inflated[..], &payload[..]);
