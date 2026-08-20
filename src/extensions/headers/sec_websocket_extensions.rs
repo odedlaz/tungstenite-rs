@@ -190,10 +190,20 @@ fn unquote(value: &str) -> String {
         return value.to_owned();
     };
 
+    // The closing quote must not itself be escaped. `"10\"` is an unterminated
+    // quoted-string rather than the value `10\`, so leave it as it arrived and
+    // let it fail the integer parse every consumer applies, instead of quietly
+    // turning it into something that parses as a different thing.
+    let trailing_backslashes = inner.len() - inner.trim_end_matches('\\').len();
+    if trailing_backslashes % 2 == 1 {
+        return value.to_owned();
+    }
+
     let mut unescaped = String::with_capacity(inner.len());
     let mut chars = inner.chars();
     while let Some(c) = chars.next() {
-        // A quoted-pair escapes the next character, whatever it is.
+        // A quoted-pair escapes the next character, whatever it is. The check
+        // above leaves an even trailing run, so a `\` always has one to take.
         unescaped.push(if c == '\\' { chars.next().unwrap_or('\\') } else { c });
     }
     unescaped
@@ -323,6 +333,20 @@ mod tests {
         let param = &extensions.0[0].params().next().expect("a param");
         assert_eq!(param.name(), "server_max_window_bits");
         assert_eq!(param.value(), Some("10"));
+    }
+
+    #[test]
+    fn parse_quoted_param_value_with_escapes() {
+        // A quoted-pair is unescaped; a backslash escaping the *closing* quote
+        // leaves the string unterminated, so the value is left as it arrived
+        // rather than becoming `10\`, which would parse as a different thing.
+        for (wire, expected) in
+            [(r#"a; p="1\0""#, r#"10"#), (r#"a; p="1\\""#, r#"1\"#), (r#"a; p="10\""#, r#""10\""#)]
+        {
+            let extensions = test_decode::<SecWebsocketExtensions>(&[wire]).expect("valid");
+            let param = extensions.0[0].params().next().expect("a param");
+            assert_eq!(param.value(), Some(expected), "wire: {wire}");
+        }
     }
 
     #[test]
