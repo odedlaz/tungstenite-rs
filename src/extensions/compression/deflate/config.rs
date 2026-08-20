@@ -111,14 +111,23 @@ pub struct PermessageDeflateConfig {
     server_max_window_bits: Option<NonZeroU8>,
     /// The `client_max_window_bits` parameter as described by [RFC 7692 Section 7.1.2.2].
     ///
-    /// In a legal extension directive, if this parameter is present, it is not
-    /// required to have a value. A `None` value indicates the parameter is not
-    /// present, `Some(None)` indicates the parameter is present without a
-    /// value, and `Some(Some(b))` indicates it is present with value `b`, where
-    /// `b` is in the range [`ALLOWED_WINDOW_BITS`].
-    ///
     /// [RFC 7692 Section 7.1.2.2]: https://tools.ietf.org/html/rfc7692#section-7.1.2.2
-    client_max_window_bits: Option<Option<NonZeroU8>>,
+    client_max_window_bits: ClientMaxWindowBits,
+}
+
+/// The state of a [`CLIENT_MAX_WINDOW_BITS`] parameter in an extension directive.
+///
+/// Unlike [`SERVER_MAX_WINDOW_BITS`], this parameter is legal with or without a
+/// value, so a directive can say three different things about it.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+enum ClientMaxWindowBits {
+    /// The parameter is not present in the directive.
+    #[default]
+    Absent,
+    /// The parameter is present without a value.
+    NoValue,
+    /// The parameter is present with a value in [`ALLOWED_WINDOW_BITS`].
+    Bits(NonZeroU8),
 }
 
 /// Client/server configuration for `permessage-deflate` support.
@@ -243,10 +252,11 @@ impl DeflateConfig {
             server_no_context_takeover,
             client_no_context_takeover,
             server_max_window_bits,
-            client_max_window_bits: Some(
-                (client_max_window_bits != *ALLOWED_WINDOW_BITS.end())
-                    .then_some(client_max_window_bits),
-            ),
+            client_max_window_bits: if client_max_window_bits == *ALLOWED_WINDOW_BITS.end() {
+                ClientMaxWindowBits::NoValue
+            } else {
+                ClientMaxWindowBits::Bits(client_max_window_bits)
+            },
         }
     }
 
@@ -320,7 +330,7 @@ impl DeflateConfig {
         };
 
         let client_max_window_bits = match client.client_max_window_bits {
-            None => {
+            ClientMaxWindowBits::Absent => {
                 if client_max_window_bits != *ALLOWED_WINDOW_BITS.end() {
                     // RFC 7692 §7.1.2.2 forbids echoing the parameter when the
                     // offer omitted it, so a locally limited window has no way
@@ -330,16 +340,18 @@ impl DeflateConfig {
                 }
                 client_max_window_bits
             }
-            Some(None) => {
+            ClientMaxWindowBits::NoValue => {
                 // The client supports the parameter so we can use our configured value.
                 client_max_window_bits
             }
-            Some(Some(client_max)) if !SUPPORTED_WINDOW_BITS.contains(&client_max) => {
+            ClientMaxWindowBits::Bits(client_max)
+                if !SUPPORTED_WINDOW_BITS.contains(&client_max) =>
+            {
                 // We can't support a window this small.
                 debug!("declining offer: {CLIENT_MAX_WINDOW_BITS} is not in the supported range");
                 return None;
             }
-            Some(Some(client_max)) => client_max.min(client_max_window_bits),
+            ClientMaxWindowBits::Bits(client_max) => client_max.min(client_max_window_bits),
         };
 
         let connection_config = DeflateConfig {
@@ -350,14 +362,16 @@ impl DeflateConfig {
             client_max_window_bits,
         };
 
-        let omit_if_max = |value| (value != *ALLOWED_WINDOW_BITS.end()).then_some(value);
-
         let offer_response = PermessageDeflateConfig {
             server_no_context_takeover,
             client_no_context_takeover,
 
             server_max_window_bits: response_server_max_window_bits,
-            client_max_window_bits: omit_if_max(client_max_window_bits).map(Some),
+            client_max_window_bits: if client_max_window_bits == *ALLOWED_WINDOW_BITS.end() {
+                ClientMaxWindowBits::Absent
+            } else {
+                ClientMaxWindowBits::Bits(client_max_window_bits)
+            },
         };
 
         Some((connection_config, offer_response))
@@ -424,8 +438,8 @@ impl DeflateConfig {
             // value, and §7 makes an invalid response value a client MUST-fail
             // — so this arm knowingly tolerates a non-conforming response
             // rather than reading a meaning into it.
-            None | Some(None) => client_max_window_bits,
-            Some(Some(received)) => {
+            ClientMaxWindowBits::Absent | ClientMaxWindowBits::NoValue => client_max_window_bits,
+            ClientMaxWindowBits::Bits(received) => {
                 // A value caps the window we compress with, and §7.1.2.2
                 // requires it be "equal to or smaller than the received
                 // value" — so an over-large one is invalid, which §7 makes a
@@ -480,8 +494,13 @@ impl PermessageDeflateConfig {
 
         let max_window_bits = [
             server_max_window_bits.map(|bits| (SERVER_MAX_WINDOW_BITS, Some(bits.to_string()))),
-            client_max_window_bits
-                .map(|bits| (CLIENT_MAX_WINDOW_BITS, bits.as_ref().map(ToString::to_string))),
+            match client_max_window_bits {
+                ClientMaxWindowBits::Absent => None,
+                ClientMaxWindowBits::NoValue => Some((CLIENT_MAX_WINDOW_BITS, None)),
+                ClientMaxWindowBits::Bits(bits) => {
+                    Some((CLIENT_MAX_WINDOW_BITS, Some(bits.to_string())))
+                }
+            },
         ]
         .into_iter()
         .flatten();
@@ -503,7 +522,7 @@ impl PermessageDeflateConfig {
             server_no_context_takeover: false,
             client_no_context_takeover: false,
             server_max_window_bits: None,
-            client_max_window_bits: None,
+            client_max_window_bits: ClientMaxWindowBits::Absent,
         };
 
         fn apply<'a>(
@@ -541,7 +560,10 @@ impl PermessageDeflateConfig {
                         Role::Server => {
                             this.server_max_window_bits = Some(bits.ok_or(value)?);
                         }
-                        Role::Client => this.client_max_window_bits = Some(bits),
+                        Role::Client => {
+                            this.client_max_window_bits =
+                                bits.map_or(ClientMaxWindowBits::NoValue, ClientMaxWindowBits::Bits)
+                        }
                     };
                     Ok(())
                 }
@@ -653,7 +675,7 @@ mod test {
                 .params()
             ),
             Ok(PermessageDeflateConfig {
-                client_max_window_bits: Some(Some(12.try_into().unwrap())),
+                client_max_window_bits: ClientMaxWindowBits::Bits(12.try_into().unwrap()),
                 server_no_context_takeover: true,
                 ..Default::default()
             })
@@ -724,13 +746,13 @@ mod test {
         const SMALLER_WINDOW: NonZeroU8 = unsafe { NonZeroU8::new_unchecked(12) };
         assert_eq!(
             server_config.accept_offer(PermessageDeflateConfig {
-                client_max_window_bits: Some(Some(SMALLER_WINDOW)),
+                client_max_window_bits: ClientMaxWindowBits::Bits(SMALLER_WINDOW),
                 ..Default::default()
             }),
             Some((
                 DeflateConfig { client_max_window_bits: SMALLER_WINDOW, ..server_config },
                 PermessageDeflateConfig {
-                    client_max_window_bits: Some(Some(SMALLER_WINDOW)),
+                    client_max_window_bits: ClientMaxWindowBits::Bits(SMALLER_WINDOW),
                     ..Default::default()
                 }
             ))
@@ -784,7 +806,7 @@ mod test {
         const SMALLER_WINDOW: NonZeroU8 = unsafe { NonZeroU8::new_unchecked(12) };
         let server_response = PermessageDeflateConfig {
             server_max_window_bits: Some(*ALLOWED_WINDOW_BITS.end()),
-            client_max_window_bits: Some(Some(SMALLER_WINDOW)),
+            client_max_window_bits: ClientMaxWindowBits::Bits(SMALLER_WINDOW),
             ..Default::default()
         };
 
