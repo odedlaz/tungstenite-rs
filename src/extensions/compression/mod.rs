@@ -14,8 +14,19 @@ pub mod deflate;
 /// field unconditionally and the `None` case needs no special handling.
 ///
 /// [`Extensions`]: crate::extensions::Extensions
+///
+/// Boxed so that the size of a connection's [`WebSocketContext`] does not
+/// depend on whether the feature is compiled in. `DeflateContext` is 64 bytes —
+/// two flate2 handles plus the takeover flags — and stored inline it is
+/// reserved on every connection, negotiated or not, growing the context from
+/// 256 to 336 bytes and the per-frame working set from four cache lines to six.
+/// A negotiated connection allocates ~143 KB of zlib windows anyway, so one
+/// pointer indirection there is free; an un-negotiated one pays 8 bytes rather
+/// than 64.
+///
+/// [`WebSocketContext`]: crate::protocol::WebSocketContext
 #[cfg(feature = "deflate")]
-pub type PerMessageCompressionContext = deflate::DeflateContext;
+pub type PerMessageCompressionContext = Box<deflate::DeflateContext>;
 
 /// Active context for performing per-message compression.
 #[cfg(not(feature = "deflate"))]
