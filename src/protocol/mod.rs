@@ -426,7 +426,7 @@ impl WebSocketContext {
         )
     }
 
-    /// Create a WebSocket context that manages an post-handshake stream.
+    /// Create a WebSocket context that manages a post-handshake stream.
     ///
     /// # Panics
     /// Panics if config is invalid e.g. `max_write_buffer_size <= write_buffer_size`.
@@ -949,7 +949,7 @@ impl WebSocketContext {
         let empty_or_pong = self
             .additional_send
             .as_ref()
-            .map_or(true, |f| f.header().opcode == OpCode::Control(OpCtl::Pong));
+            .is_none_or(|f| f.header().opcode == OpCode::Control(OpCtl::Pong));
         if empty_or_pong {
             self.additional_send.replace(add);
         }
