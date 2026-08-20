@@ -27,7 +27,7 @@ native-tls-vendored = ["native-tls", "native-tls-crate/vendored"]
 rustls-tls-native-roots = ["__rustls-tls", "rustls-native-certs"]
 rustls-tls-webpki-roots = ["__rustls-tls", "webpki-roots"]
 __rustls-tls = ["rustls", "rustls-pki-types"]
-deflate = ["headers", "flate2"]
+deflate = ["handshake", "flate2"]
 
 [dependencies]
 data-encoding = { version = "2", optional = true }
