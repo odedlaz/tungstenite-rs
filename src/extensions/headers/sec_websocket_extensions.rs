@@ -174,10 +174,29 @@ impl FromStr for WebsocketExtensionParam {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let (name, value) = s.split_once('=').map(|(n, t)| (n, Some(t))).unwrap_or((s, None));
 
-        let value = value.map(|value| value.trim().to_owned());
+        let value = value.map(|value| unquote(value.trim()));
 
         Ok(Self { name: name.trim().to_owned().into(), value })
     }
+}
+
+/// Undoes the `quoted-string` form RFC 6455 §9.1 allows for a param value.
+///
+/// Values reach consumers that parse them as integers, so a quoted value has to
+/// arrive unquoted or it fails to parse — silently declining compression on the
+/// server side and failing a legal handshake on the client side.
+fn unquote(value: &str) -> String {
+    let Some(inner) = value.strip_prefix('"').and_then(|value| value.strip_suffix('"')) else {
+        return value.to_owned();
+    };
+
+    let mut unescaped = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        // A quoted-pair escapes the next character, whatever it is.
+        unescaped.push(if c == '\\' { chars.next().unwrap_or('\\') } else { c });
+    }
+    unescaped
 }
 
 impl std::fmt::Display for WebsocketExtensionParam {
@@ -289,6 +308,21 @@ mod tests {
         let mut map = ::http::HeaderMap::new();
         map.typed_insert(header);
         map
+    }
+
+    #[test]
+    fn parse_quoted_param_value() {
+        // RFC 6455 §9.1 gives extension param values as `token | quoted-string`,
+        // so a quoted value is legal on the wire and must reach the consumer
+        // unquoted or it will not parse as an integer.
+        let extensions = test_decode::<SecWebsocketExtensions>(&[
+            "permessage-deflate; server_max_window_bits=\"10\"",
+        ])
+        .expect("valid");
+
+        let param = &extensions.0[0].params().next().expect("a param");
+        assert_eq!(param.name(), "server_max_window_bits");
+        assert_eq!(param.value(), Some("10"));
     }
 
     #[test]

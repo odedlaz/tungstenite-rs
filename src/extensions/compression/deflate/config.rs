@@ -661,6 +661,27 @@ mod test {
     use super::*;
 
     #[test]
+    fn deflate_config_parse_params_accepts_quoted_values() {
+        // A quoted value is legal per RFC 6455 §9.1. Rejecting it silently
+        // declined compression as a server and failed a legal handshake as a
+        // client, since both sides parse this value as an integer.
+        assert_eq!(
+            PermessageDeflateConfig::parse_params(
+                WebsocketProtocolExtension::from_str(
+                    "permessage-deflate; server_max_window_bits=\"10\"; client_max_window_bits=\"9\""
+                )
+                .unwrap()
+                .params()
+            ),
+            Ok(PermessageDeflateConfig {
+                server_max_window_bits: Some(10.try_into().unwrap()),
+                client_max_window_bits: ClientMaxWindowBits::Bits(9.try_into().unwrap()),
+                ..Default::default()
+            })
+        );
+    }
+
+    #[test]
     fn deflate_config_parse_params_valid() {
         assert_eq!(
             PermessageDeflateConfig::parse_params([]),
