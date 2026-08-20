@@ -20,7 +20,7 @@ use super::{
     HandshakeRole, MidHandshake, ProcessingResult,
 };
 #[cfg(feature = "deflate")]
-use crate::extensions::headers::SecWebsocketExtensions;
+use crate::extensions::{headers::SecWebsocketExtensions, ExtensionsError};
 use crate::{
     error::{Error, ProtocolError, Result, SubProtocolError, UrlError},
     extensions::{Extensions, ExtensionsConfig},
@@ -61,6 +61,9 @@ impl<S: Read + Write> ClientHandshake<S> {
         let _ = crate::client::uri_mode(request.uri())?;
 
         let subprotocols = extract_subprotocols_from_request(&request)?;
+        #[cfg(feature = "deflate")]
+        let caller_offered_extensions =
+            request.headers().contains_key(SecWebsocketExtensions::name());
 
         // Convert and verify the `http::Request` and turn it into the request as per RFC.
         // Also extract the key from it (it must be present in a correct request).
@@ -71,7 +74,12 @@ impl<S: Read + Write> ClientHandshake<S> {
         let client = {
             let accept_key = derive_accept_key(key.as_ref());
             ClientHandshake {
-                verify_data: VerifyData { accept_key, subprotocols },
+                verify_data: VerifyData {
+                    accept_key,
+                    subprotocols,
+                    #[cfg(feature = "deflate")]
+                    caller_offered_extensions,
+                },
                 config,
                 _marker: PhantomData,
             }
@@ -241,6 +249,15 @@ struct VerifyData {
 
     /// Accepted subprotocols
     subprotocols: Option<Vec<String>>,
+
+    /// Whether the request carried a `Sec-WebSocket-Extensions` header the
+    /// caller wrote themselves.
+    ///
+    /// Only read when there is no [`ExtensionsConfig`], and in that case
+    /// `generate_request` appends no offer of its own — so wherever this is
+    /// consulted it means "the request as sent offered an extension".
+    #[cfg(feature = "deflate")]
+    caller_offered_extensions: bool,
 }
 
 impl VerifyData {
@@ -306,11 +323,21 @@ impl VerifyData {
                 (Some(agreed), Some(config)) => {
                     config.verify_agreed_on(agreed).map_err(ProtocolError::from)?
                 }
-                // Either the server echoed nothing, or we offered nothing
-                // through the config and the caller wrote the request header by
-                // hand — upstream ignored the echo rather than failing, and
-                // there is no agreement of ours to check it against.
-                _ => Extensions::default(),
+                // The offer was the caller's own header, so there is no
+                // agreement of ours to check the echo against — upstream
+                // ignored it rather than failing.
+                (Some(_), None) if self.caller_offered_extensions => Extensions::default(),
+                // Nothing was offered at all. A header that names an extension
+                // is then step 5 above; one that names none indicates none.
+                (Some(agreed), None) => match agreed.iter().next() {
+                    Some(unrequested) => {
+                        return Err(Error::Protocol(
+                            ExtensionsError::InvalidExtension(unrequested.name().into()).into(),
+                        ))
+                    }
+                    None => Extensions::default(),
+                },
+                (None, _) => Extensions::default(),
             }
         };
         #[cfg(not(feature = "deflate"))]
@@ -395,7 +422,7 @@ mod tests {
 
     #[cfg(feature = "deflate")]
     #[test]
-    fn response_extensions_without_config_are_ignored() {
+    fn response_extension_echoing_a_manual_offer_is_ignored() {
         // Mirror of the server-side config-`None` defect: a client that offers
         // an extension by hand has no `ExtensionsConfig`, and upstream ignored
         // the server's echo. Treating `None` as an error kills the handshake.
@@ -403,7 +430,11 @@ mod tests {
 
         let key = "dGhlIHNhbXBsZSBub25jZQ==";
         let accept = crate::handshake::derive_accept_key(key.as_bytes());
-        let verify = VerifyData { accept_key: accept.clone(), subprotocols: None };
+        let verify = VerifyData {
+            accept_key: accept.clone(),
+            subprotocols: None,
+            caller_offered_extensions: true,
+        };
 
         let response = http::Response::builder()
             .status(101)
@@ -415,6 +446,70 @@ mod tests {
             .unwrap();
 
         verify.verify_response(response, None).expect("a manual offer must not be fatal");
+    }
+
+    #[cfg(feature = "deflate")]
+    #[test]
+    fn response_extension_never_offered_is_rejected() {
+        // RFC 6455 §4.1 step 5: an extension the client's handshake did not
+        // contain is a MUST-fail. `client()` and `connect()` pass no config and
+        // write no header, so this is the default path, not an exotic one.
+        use super::VerifyData;
+        use crate::{error::ProtocolError, extensions::ExtensionsError, Error};
+
+        let key = "dGhlIHNhbXBsZSBub25jZQ==";
+        let accept = crate::handshake::derive_accept_key(key.as_bytes());
+        let verify = VerifyData {
+            accept_key: accept.clone(),
+            subprotocols: None,
+            caller_offered_extensions: false,
+        };
+
+        let response = http::Response::builder()
+            .status(101)
+            .header("Connection", "Upgrade")
+            .header("Upgrade", "websocket")
+            .header("Sec-WebSocket-Accept", accept)
+            .header("Sec-WebSocket-Extensions", "x-custom-extension")
+            .body(None)
+            .unwrap();
+
+        let err = verify.verify_response(response, None).expect_err("§4.1 step 5 is a MUST-fail");
+        assert!(
+            matches!(
+                &err,
+                Error::Protocol(ProtocolError::InvalidExtensionsHeader(e))
+                    if **e == ExtensionsError::InvalidExtension("x-custom-extension".into())
+            ),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[cfg(feature = "deflate")]
+    #[test]
+    fn response_extension_header_naming_nothing_is_ignored() {
+        // An empty header indicates no extension, so there is nothing the
+        // client's handshake failed to contain.
+        use super::VerifyData;
+
+        let key = "dGhlIHNhbXBsZSBub25jZQ==";
+        let accept = crate::handshake::derive_accept_key(key.as_bytes());
+        let verify = VerifyData {
+            accept_key: accept.clone(),
+            subprotocols: None,
+            caller_offered_extensions: false,
+        };
+
+        let response = http::Response::builder()
+            .status(101)
+            .header("Connection", "Upgrade")
+            .header("Upgrade", "websocket")
+            .header("Sec-WebSocket-Accept", accept)
+            .header("Sec-WebSocket-Extensions", "")
+            .body(None)
+            .unwrap();
+
+        verify.verify_response(response, None).expect("an empty header offers nothing to reject");
     }
 
     #[cfg(feature = "deflate")]
@@ -431,7 +526,11 @@ mod tests {
 
         let key = "dGhlIHNhbXBsZSBub25jZQ==";
         let accept = crate::handshake::derive_accept_key(key.as_bytes());
-        let verify = VerifyData { accept_key: accept.clone(), subprotocols: None };
+        let verify = VerifyData {
+            accept_key: accept.clone(),
+            subprotocols: None,
+            caller_offered_extensions: true,
+        };
         let config = ExtensionsConfig { permessage_deflate: Some(DeflateConfig::default()) };
 
         let response = http::Response::builder()
