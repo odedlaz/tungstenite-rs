@@ -189,11 +189,15 @@ impl DeflateCompress {
         log::trace!("flushing compressed data");
 
         // RFC 7692 §7.2.1 step 2 wants the payload to end with an empty
-        // uncompressed block, which is then truncated off. One `compress_vec`
-        // with an empty slice ought to emit it, but not on every backend: it
-        // returns `Ok` as soon as *any* output is written, so loop until it
-        // stops making progress. See miniz_oxide#105:
-        // https://github.com/Frommi/miniz_oxide/issues/105
+        // uncompressed block, which step 3 then truncates off. One
+        // `compress_vec` with an empty slice ought to emit it — it is
+        // documented to write "as much output as possible" — but some backends
+        // return `Ok` as soon as *any* output is written, so loop until it
+        // stops making progress. The loop can go once that contradiction is
+        // fixed:
+        // - https://github.com/Frommi/miniz_oxide/issues/105
+        // - https://github.com/rust-lang/flate2-rs/blob/1.1.2/src/ffi/rust.rs#L169
+        // - https://github.com/Frommi/miniz_oxide/blob/0.8.8/miniz_oxide/src/deflate/stream.rs#L82
         {
             let mut total_out = self.compressor.total_out();
             loop {
@@ -213,10 +217,8 @@ impl DeflateCompress {
             }
         }
 
-        //     3.  Remove 4 octets (that are 0x00 0x00 0xff 0xff) from the tail
-        //         end.  After this step, the last octet of the compressed data
-        //         contains (possibly part of) the DEFLATE header bits with the
-        //         "BTYPE" bits set to 00.
+        // RFC 7692 §7.2.1 step 3: remove the trailing 0x00 0x00 0xff 0xff, so
+        // the last octet holds DEFLATE header bits with BTYPE set to 00.
 
         debug_assert!(output.ends_with(ELIDED_TRAILER_BLOCK_CONTENTS), "output is {output:02x?}");
         output.truncate(output.len() - ELIDED_TRAILER_BLOCK_CONTENTS.len());
@@ -288,9 +290,13 @@ impl DeflateDecompress {
                     }
                     Status::StreamEnd => {
                         // A peer without an empty-block flush may set BFINAL
-                        // instead (RFC 7692 §7.2.3.4). Reset and assume nothing
-                        // after it back-references this block — imperfect, but
-                        // it matches other deployed implementations.
+                        // instead (RFC 7692 §7.2.3.4). `reset` discards the
+                        // whole sliding window, which is only safe if the peer
+                        // set BFINAL by telling its own compressor the stream
+                        // was ending — resetting its window too — so nothing
+                        // later back-references this block or any before it. A
+                        // peer that sets BFINAL some other way breaks that, but
+                        // this matches other deployed implementations.
                         self.decompressor.reset(false);
                         total_read = 0;
                     }

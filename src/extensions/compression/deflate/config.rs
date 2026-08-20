@@ -276,9 +276,10 @@ impl DeflateConfig {
         &self,
         client: PermessageDeflateConfig,
     ) -> Option<(DeflateConfig, PermessageDeflateConfig)> {
-        // `None` declines the offer, which RFC 7692 §7 requires for an
-        // undefined or repeated parameter, an invalid value, or a configuration
-        // we cannot support.
+        // `None` declines the offer. Of RFC 7692 §7's four decline conditions
+        // this covers only the last, an unsupportable configuration; undefined,
+        // repeated and invalid parameters are rejected earlier, in
+        // `parse_params` and `accept_offers`.
         let Self {
             server_no_context_takeover,
             client_no_context_takeover,
@@ -287,10 +288,14 @@ impl DeflateConfig {
             compression,
         } = *self;
 
-        // Either peer can switch context takeover off, and the server may do
-        // so even when the offer stayed silent. RFC 7692 §7.1.1.1, §7.1.1.2.
+        // Required: RFC 7692 §7.1.1.1 defines accepting an offer that carries
+        // this parameter as echoing it, and returning `Some` here is that
+        // acceptance. Dropping the second term would emit an accepting response
+        // that omits the parameter.
         let server_no_context_takeover =
             server_no_context_takeover || client.server_no_context_takeover;
+        // Discretionary: §7.1.1.2 lets the server ignore the client's offered
+        // parameter instead. Honouring it is our choice, not compliance.
         let client_no_context_takeover =
             client_no_context_takeover || client.client_no_context_takeover;
 
@@ -413,13 +418,18 @@ impl DeflateConfig {
         };
 
         let client_max_window_bits = match server.client_max_window_bits {
-            // Neither form constrains us: absent means the server accepts a
-            // full 32,768-byte window, and present-but-empty is read the same
-            // way — the RFC does not quite settle that, so take Postel's
-            // reading. RFC 7692 §7.1.2.2.
+            // Absent means the server accepts a full 32,768-byte window
+            // (RFC 7692 §7.1.2.2). Present-but-empty is arguably not legal at
+            // all — §7.1.2.2 gives the response-side parameter a `1*DIGIT`
+            // value, and §7 makes an invalid response value a client MUST-fail
+            // — so this arm knowingly tolerates a non-conforming response
+            // rather than reading a meaning into it.
             None | Some(None) => client_max_window_bits,
             Some(Some(received)) => {
-                // A value caps the window we compress with. RFC 7692 §7.1.2.2.
+                // A value caps the window we compress with, and §7.1.2.2
+                // requires it be "equal to or smaller than the received
+                // value" — so an over-large one is invalid, which §7 makes a
+                // client MUST-fail. Hence the error rather than a clamp.
                 if !SUPPORTED_WINDOW_BITS.contains(&received) {
                     return Err(NegotiationError::UnsupportedClientMaxWindowBitsValue(
                         received.get(),
