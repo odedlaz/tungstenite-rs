@@ -383,7 +383,7 @@ impl From<DeflateContext> for super::PerMessageCompressionContext {
 
 #[cfg(test)]
 pub(crate) mod test {
-    use rand::{distr::Distribution as _, RngCore, SeedableRng as _};
+    use rand::{distr::Distribution as _, Rng as _, SeedableRng as _};
 
     use super::*;
 

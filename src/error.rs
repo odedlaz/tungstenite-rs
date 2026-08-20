@@ -202,7 +202,7 @@ pub enum ProtocolError {
     SecWebSocketSubProtocolError(SubProtocolError),
     /// The `Sec-WebSocket-Extensions` header is invalid.
     #[error("Invalid \"Sec-WebSocket-Extensions\" header: {0}")]
-    InvalidExtensionsHeader(#[from] ExtensionsError),
+    InvalidExtensionsHeader(Box<ExtensionsError>),
     /// Garbage data encountered after client request.
     #[error("Junk after client request")]
     JunkAfterRequest,
@@ -318,6 +318,12 @@ pub enum TlsError {
     InvalidDnsName,
 }
 
+impl From<ExtensionsError> for ProtocolError {
+    fn from(e: ExtensionsError) -> Self {
+        Self::InvalidExtensionsHeader(e.into())
+    }
+}
+
 #[cfg(feature = "native-tls")]
 impl From<native_tls_crate::Error> for TlsError {
     fn from(e: native_tls_crate::Error) -> Self {
@@ -349,6 +355,6 @@ mod test {
     #[test]
     fn protocol_error_size() {
         let size = std::mem::size_of::<crate::error::ProtocolError>();
-        assert!(size <= 24, "ProtocolError is large: {size}");
+        assert!(size <= 16, "ProtocolError is large: {size}");
     }
 }
