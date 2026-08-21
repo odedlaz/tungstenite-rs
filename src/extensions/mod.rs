@@ -7,7 +7,7 @@ use thiserror::Error;
 use crate::extensions::compression::{
     CompressionError, DecompressionError, PerMessageCompressionContext,
 };
-#[cfg(feature = "handshake")]
+#[cfg(feature = "deflate")]
 use crate::extensions::headers::{SecWebsocketExtensions, WebsocketProtocolExtension};
 use crate::protocol::Role;
 
@@ -49,7 +49,7 @@ pub enum ExtensionsError {
     MalformedExtension(&'static str),
 }
 
-#[cfg(feature = "handshake")]
+#[cfg(feature = "deflate")]
 impl ExtensionsConfig {
     pub(crate) fn generate_offers(&self) -> impl Iterator<Item = WebsocketProtocolExtension> {
         let Self {
@@ -112,7 +112,7 @@ impl ExtensionsConfig {
                     })?;
 
                     per_message_compression =
-                        Some(DeflateContext::new(Role::Client, deflate_config).into());
+                        Some(DeflateContext::new(Role::Client, deflate_config));
                 }
                 name => return Err(ExtensionsError::InvalidExtension(name.into())),
             }
@@ -155,49 +155,23 @@ impl ExtensionsConfig {
                     {
                         Ok(extension) => extension,
                         Err(e) => {
-                            // Per RFC 7692 Section 7:
-                            //
-                            //  A server MUST decline an extension negotiation
-                            //  offer for this extension if any of the following
-                            //  conditions are met:
-                            //
-                            //   o  The negotiation offer contains an extension
-                            //   parameter not defined for use in an offer.
-                            //
-                            // Declining instead of rejecting the request
-                            // outright allows clients that conform to a
-                            // (currently hypothetical) RFC that supersedes RFC
-                            // 7692 to fall back to requesting to the behavior
-                            // specified in the latter.
+                            // Decline this offer rather than reject the whole
+                            // request, so a client offering some future PMCE can
+                            // still fall back to RFC 7692. §7 requires declining
+                            // an offer carrying an undefined parameter.
                             log::debug!("{EXTENSION_NAME} extension: {e}");
                             continue;
                         }
                     };
-                    // Per RFC 7692 Section 5:
-                    //
-                    //   A client may also offer multiple PMCE choices to the server
-                    //   by including multiple elements in the
-                    //   "Sec-WebSocket-Extensions" header, one for each PMCE
-                    //   offered.  This set of elements MAY include multiple PMCEs
-                    //   with the same extension name to offer the possibility to
-                    //   use the same algorithm with different configuration
-                    //   parameters.  The order of elements is important as it
-                    //   specifies the client's preference.  An element preceding
-                    //   another element has higher preference.  It is recommended
-                    //   that a server accepts PMCEs with higher preference if the
-                    //   server supports them.
-                    //
-                    // Follow the RFC recommendation by not overwriting a PMCE that
-                    // is already configured.
+                    // Offers arrive in the client's preference order, so keep
+                    // the first one that matched. RFC 7692 §5.
                     if per_message_compression.is_some() {
                         continue;
                     }
 
                     if let Some((config, response)) = deflate.accept_offer(extension) {
-                        per_message_compression = Some((
-                            DeflateContext::new(Role::Server, config).into(),
-                            response.into(),
-                        ));
+                        per_message_compression =
+                            Some((DeflateContext::new(Role::Server, config), response.into()));
                     }
                 }
                 // Ignore any unknown extensions in the offer.
@@ -238,7 +212,7 @@ impl ExtensionsConfig {
         #[cfg(feature = "deflate")]
         {
             per_message_compression = permessage_deflate
-                .map(|deflate| compression::deflate::DeflateContext::new(role, deflate).into());
+                .map(|deflate| compression::deflate::DeflateContext::new(role, deflate));
         }
         let _ = role;
 
@@ -260,7 +234,9 @@ impl Extensions {
     ) -> Option<impl FnOnce(&Bytes) -> Result<Bytes, CompressionError> + 's> {
         let Self { per_message_compression } = self;
 
-        per_message_compression.as_mut().map(PerMessageCompressionContext::compressor)
+        per_message_compression
+            .as_mut()
+            .map(|context| move |payload: &Bytes| compression::compress(context, payload))
     }
 
     /// Returns a function that, if present, decompresses a frame payload.
@@ -278,11 +254,15 @@ impl Extensions {
         &'s mut self,
     ) -> Option<impl FnMut(&Bytes, bool, usize) -> Result<Bytes, DecompressionError> + 's> {
         let Self { per_message_compression } = self;
-        per_message_compression.as_mut().map(PerMessageCompressionContext::decompressor)
+        per_message_compression.as_mut().map(|context| {
+            move |payload: &Bytes, is_final, size_limit| {
+                compression::decompress(context, payload, is_final, size_limit)
+            }
+        })
     }
 }
 
-#[cfg(feature = "handshake")]
+#[cfg(feature = "deflate")]
 #[cfg(test)]
 mod test {
     use super::*;
@@ -376,7 +356,7 @@ mod test {
             ]))
             .unwrap();
 
-        assert!(matches!(per_message_compression, Some(PerMessageCompressionContext::Deflate(_))));
+        assert!(per_message_compression.is_some());
         assert_eq!(
             response,
             Some(SecWebsocketExtensions::new([DeflateConfig::new()

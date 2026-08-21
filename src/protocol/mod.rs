@@ -1167,6 +1167,52 @@ mod tests {
 
     #[cfg(feature = "deflate")]
     #[test]
+    fn per_message_compression_rejects_compressed_control_frame() {
+        // Per RFC 7692 §6.1 the compressed bit is illegal on a control frame
+        // even while the extension is negotiated.
+        use crate::extensions::compression::deflate::DeflateConfig;
+
+        // FIN + RSV1 + Ping, empty payload.
+        let incoming = Cursor::new(&[0xc9, 0x00]);
+        let config = WebSocketConfig {
+            extensions: ExtensionsConfig { permessage_deflate: Some(DeflateConfig::default()) },
+            ..Default::default()
+        };
+        let mut socket = WebSocket::from_raw_socket(WriteMoc(incoming), Role::Client, Some(config));
+
+        assert!(matches!(
+            socket.read().unwrap_err(),
+            Error::Protocol(crate::error::ProtocolError::CompressedControlFrame)
+        ));
+    }
+
+    #[cfg(feature = "deflate")]
+    #[test]
+    fn per_message_compression_rejects_compressed_continue_frame() {
+        // The two-frame message from RFC 7692 §7.2.3.2, but with RSV1 also set
+        // on the continuation. §6.1 allows the bit only on the first fragment.
+        use crate::extensions::compression::deflate::DeflateConfig;
+
+        let incoming = Cursor::new(&[
+            // first fragment: RSV1, Text, not final — legal
+            0x41, 0x03, 0xf2, 0x48, 0xcd,
+            // continuation, which the RFC sends as 0x80; RSV1 set here
+            0xc0, 0x04, 0xc9, 0xc9, 0x07, 0x00,
+        ]);
+        let config = WebSocketConfig {
+            extensions: ExtensionsConfig { permessage_deflate: Some(DeflateConfig::default()) },
+            ..Default::default()
+        };
+        let mut socket = WebSocket::from_raw_socket(WriteMoc(incoming), Role::Client, Some(config));
+
+        assert!(matches!(
+            socket.read().unwrap_err(),
+            Error::Protocol(crate::error::ProtocolError::CompressedContinueFrame)
+        ));
+    }
+
+    #[cfg(feature = "deflate")]
+    #[test]
     fn per_message_compression_decompress_respects_message_size_limit() {
         use crate::extensions::compression::deflate::test::very_compressed;
         use crate::extensions::compression::deflate::DeflateConfig;

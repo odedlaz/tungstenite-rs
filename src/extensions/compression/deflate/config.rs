@@ -111,14 +111,23 @@ pub struct PermessageDeflateConfig {
     server_max_window_bits: Option<NonZeroU8>,
     /// The `client_max_window_bits` parameter as described by [RFC 7692 Section 7.1.2.2].
     ///
-    /// In a legal extension directive, if this parameter is present, it is not
-    /// required to have a value. A `None` value indicates the parameter is not
-    /// present, `Some(None)` indicates the parameter is present without a
-    /// value, and `Some(Some(b))` indicates it is present with value `b`, where
-    /// `b` is in the range [`ALLOWED_WINDOW_BITS`].
-    ///
     /// [RFC 7692 Section 7.1.2.2]: https://tools.ietf.org/html/rfc7692#section-7.1.2.2
-    client_max_window_bits: Option<Option<NonZeroU8>>,
+    client_max_window_bits: ClientMaxWindowBits,
+}
+
+/// The state of a [`CLIENT_MAX_WINDOW_BITS`] parameter in an extension directive.
+///
+/// Unlike [`SERVER_MAX_WINDOW_BITS`], this parameter is legal with or without a
+/// value, so a directive can say three different things about it.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+enum ClientMaxWindowBits {
+    /// The parameter is not present in the directive.
+    #[default]
+    Absent,
+    /// The parameter is present without a value.
+    NoValue,
+    /// The parameter is present with a value in [`ALLOWED_WINDOW_BITS`].
+    Bits(NonZeroU8),
 }
 
 /// Client/server configuration for `permessage-deflate` support.
@@ -233,26 +242,9 @@ impl DeflateConfig {
             compression: _,
         } = *self;
 
-        // From RFC 7692 Section 7.1.2.1:
-        //
-        //   A client MAY include the "server_max_window_bits" extension
-        //   parameter in an extension negotiation offer.
-        //
-        // ...
-
-        //   By including this parameter in an extension negotiation offer, a
-        //   client limits the LZ77 sliding window size that the server will use
-        //   to compress messages.  If the peer server uses a small LZ77 sliding
-        //   window to compress messages, the client can reduce the memory
-        //   needed for the LZ77 sliding window.
-        //
-        //   A server declines an extension negotiation offer with this
-        //   parameter if the server doesn't support it.
-        //
-        // If the client doesn't need the server to use a smaller window size
-        // than the protocol max, then don't include the parameter since not all
-        // servers will recognize it, and including it might result in the
-        // server rejecting the offer.
+        // Only offer `server_max_window_bits` when we want a smaller window
+        // than the max: a server that doesn't recognize the parameter declines
+        // the whole offer. RFC 7692 §7.1.2.1.
         let server_max_window_bits = (server_max_window_bits != *ALLOWED_WINDOW_BITS.end())
             .then_some(server_max_window_bits);
 
@@ -260,10 +252,11 @@ impl DeflateConfig {
             server_no_context_takeover,
             client_no_context_takeover,
             server_max_window_bits,
-            client_max_window_bits: Some(
-                (client_max_window_bits != *ALLOWED_WINDOW_BITS.end())
-                    .then_some(client_max_window_bits),
-            ),
+            client_max_window_bits: if client_max_window_bits == *ALLOWED_WINDOW_BITS.end() {
+                ClientMaxWindowBits::NoValue
+            } else {
+                ClientMaxWindowBits::Bits(client_max_window_bits)
+            },
         }
     }
 
@@ -293,14 +286,10 @@ impl DeflateConfig {
         &self,
         client: PermessageDeflateConfig,
     ) -> Option<(DeflateConfig, PermessageDeflateConfig)> {
-        // RFC 7692 Section 7:
-
-        //   A server MUST decline an extension negotiation offer for this
-        //   extension if any of the following conditions are met:
-        //   - The negotiation offer contains an extension parameter not defined for use in an offer.
-        //   - The negotiation offer contains an extension parameter with an invalid value.
-        //   - The negotiation offer contains multiple extension parameters with the same name.
-        //   - The server doesn't support the offered configuration.
+        // `None` declines the offer. Of RFC 7692 §7's four decline conditions
+        // this covers only the last, an unsupportable configuration; undefined,
+        // repeated and invalid parameters are rejected earlier, in
+        // `parse_params` and `accept_offers`.
         let Self {
             server_no_context_takeover,
             client_no_context_takeover,
@@ -309,48 +298,19 @@ impl DeflateConfig {
             compression,
         } = *self;
 
-        // From RFC 7692 Section 7.1.1.1:
-        //
-        //   A server accepts an extension negotiation offer that includes the
-        //   "server_no_context_takeover" extension parameter by including the
-        //   "server_no_context_takeover" extension parameter in the corresponding
-        //   extension negotiation response to send back to the client.  The
-        //   "server_no_context_takeover" extension parameter in an extension
-        //   negotiation response has no value.
-        //
-        // ...
-        //
-        //   A server MAY include the "server_no_context_takeover" extension
-        //   parameter in an extension negotiation response even if the extension
-        //   negotiation offer being accepted by the extension negotiation
-        //   response didn't include the "server_no_context_takeover" extension
-        //   parameter.
+        // Required: RFC 7692 §7.1.1.1 defines accepting an offer that carries
+        // this parameter as echoing it, and returning `Some` here is that
+        // acceptance. Dropping the second term would emit an accepting response
+        // that omits the parameter.
         let server_no_context_takeover =
             server_no_context_takeover || client.server_no_context_takeover;
-
-        // From RFC 7692 Section 7.1.1.2:
-        //
-        //   A server MAY include the "client_no_context_takeover" extension
-        //   parameter in an extension negotiation response.  If the received
-        //   extension negotiation offer includes the
-        //   "client_no_context_takeover" extension parameter, the server may
-        //   either ignore the parameter or use the parameter to avoid taking
-        //   over the LZ77 sliding window unnecessarily by including the
-        //   "client_no_context_takeover" extension parameter in the
-        //   corresponding extension negotiation response to the offer.
+        // Discretionary: §7.1.1.2 lets the server ignore the client's offered
+        // parameter instead. Honouring it is our choice, not compliance.
         let client_no_context_takeover =
             client_no_context_takeover || client.client_no_context_takeover;
 
-        // From RFC 7692 Section 7.1.2.1:
-        //   A server accepts an extension negotiation offer with this parameter
-        //   by including the "server_max_window_bits" extension parameter in
-        //   the extension negotiation response to send back to the client with
-        //   the same or smaller value as the offer.
-        //
-        //   A server MAY include the "server_max_window_bits" extension
-        //   parameter in an extension negotiation response even if the
-        //   extension negotiation offer being accepted by the response didn't
-        //   include the "server_max_window_bits" extension parameter.
+        // The response echoes the same or a smaller window than the offer.
+        // RFC 7692 §7.1.2.1.
         let (server_max_window_bits, response_server_max_window_bits) = match client
             .server_max_window_bits
         {
@@ -370,37 +330,28 @@ impl DeflateConfig {
         };
 
         let client_max_window_bits = match client.client_max_window_bits {
-            None => {
-                // From RFC 7692 Section 7.1.2.2:
-                //
-                //    If a received extension negotiation offer doesn't have the
-                //    "client_max_window_bits" extension parameter, the
-                //    corresponding extension negotiation response to the offer
-                //    MUST NOT include the "client_max_window_bits" extension
-                //    parameter.
-
+            ClientMaxWindowBits::Absent => {
                 if client_max_window_bits != *ALLOWED_WINDOW_BITS.end() {
-                    // The server is configured to allocate a limited size
-                    // window for each client stream, and the client didn't
-                    // indicate that it supports the parameter. Per the RFC,
-                    // the server can't include the extension parameter. We
-                    // make the choice that it's more important to respect
-                    // the server configuration and so decline the offer.
+                    // RFC 7692 §7.1.2.2 forbids echoing the parameter when the
+                    // offer omitted it, so a locally limited window has no way
+                    // to be signalled: respect the config and decline.
                     debug!("declining offer without {CLIENT_MAX_WINDOW_BITS} (locally limited to {client_max_window_bits})");
                     return None;
                 }
                 client_max_window_bits
             }
-            Some(None) => {
+            ClientMaxWindowBits::NoValue => {
                 // The client supports the parameter so we can use our configured value.
                 client_max_window_bits
             }
-            Some(Some(client_max)) if !SUPPORTED_WINDOW_BITS.contains(&client_max) => {
+            ClientMaxWindowBits::Bits(client_max)
+                if !SUPPORTED_WINDOW_BITS.contains(&client_max) =>
+            {
                 // We can't support a window this small.
                 debug!("declining offer: {CLIENT_MAX_WINDOW_BITS} is not in the supported range");
                 return None;
             }
-            Some(Some(client_max)) => client_max.min(client_max_window_bits),
+            ClientMaxWindowBits::Bits(client_max) => client_max.min(client_max_window_bits),
         };
 
         let connection_config = DeflateConfig {
@@ -411,14 +362,16 @@ impl DeflateConfig {
             client_max_window_bits,
         };
 
-        let omit_if_max = |value| (value != *ALLOWED_WINDOW_BITS.end()).then_some(value);
-
         let offer_response = PermessageDeflateConfig {
             server_no_context_takeover,
             client_no_context_takeover,
 
             server_max_window_bits: response_server_max_window_bits,
-            client_max_window_bits: omit_if_max(client_max_window_bits).map(Some),
+            client_max_window_bits: if client_max_window_bits == *ALLOWED_WINDOW_BITS.end() {
+                ClientMaxWindowBits::Absent
+            } else {
+                ClientMaxWindowBits::Bits(client_max_window_bits)
+            },
         };
 
         Some((connection_config, offer_response))
@@ -451,24 +404,13 @@ impl DeflateConfig {
                 server.server_no_context_takeover
             };
 
-        // Per RFC 7.1.1.2:
-        //
-        //   By including the "client_no_context_takeover" extension parameter
-        //   in an extension negotiation response, a server prevents the peer
-        //   client from using context takeover.
+        // The server can force client-side takeover off. RFC 7692 §7.1.1.2.
         let client_no_context_takeover =
             client_no_context_takeover || server.client_no_context_takeover;
 
         let server_max_window_bits = {
-            // Per RFC 7.1.2.1:
-            //
-            //   A server accepts an extension negotiation offer with this
-            //   parameter by including the "server_max_window_bits" extension
-            //   parameter in the extension negotiation response to send back to
-            //   the client with the same or smaller value as the offer.
-            //
-            // An accepted offer should include the same or smaller value
-            // than the one requested, if any.
+            // An accepted offer echoes the same or a smaller value than the
+            // one we asked for. RFC 7692 §7.1.2.1.
             let default_server_max_bits = || {
                 (server_max_window_bits == *ALLOWED_WINDOW_BITS.end())
                     .then_some(server_max_window_bits)
@@ -490,49 +432,18 @@ impl DeflateConfig {
         };
 
         let client_max_window_bits = match server.client_max_window_bits {
-            None => {
-                // From RFC 7692 Section 7.1.2.2:
-                //
-                //   If a received extension negotiation offer has the
-                //   "client_max_window_bits" extension parameter, the server
-                //   MAY include the "client_max_window_bits" extension
-                //   parameter in the corresponding extension negotiation
-                //   response to the offer.
-                //
-                // ...
-                //
-                //   Absence of this extension parameter in an extension
-                //   negotiation response indicates that the server can receive
-                //   messages compressed using an LZ77 sliding window of up to
-                //   32,768 bytes.
-                client_max_window_bits
-            }
-            Some(None) => {
-                // From RFC 7692 Section 7.1.2.2:
-                //
-                //   If the "client_max_window_bits" extension parameter in a
-                //   received extension negotiation offer has a value, the
-                //   server may either ignore this value or use this value to
-                //   avoid allocating an unnecessarily big LZ77 sliding window
-                //   by including the "client_max_window_bits" extension
-                //   parameter in the corresponding extension negotiation
-                //   response to the offer with a value equal to or smaller than
-                //   the received value.
-                //
-                // It's not completely clear whether the RFC allows the server
-                // to send the parameter without a value, but in the spirit of
-                // Postel's law, interpret this as the server not constraining
-                // the client.
-                client_max_window_bits
-            }
-            Some(Some(received)) => {
-                // From RFC 7692 Section 7.1.2.2:
-                //
-                // By including this extension parameter in an extension
-                // negotiation response, a server limits the LZ77 sliding window
-                // size that the client uses to compress messages.  This reduces
-                // the amount of memory for the decompression context that the
-                // server has to reserve for the connection.
+            // Absent means the server accepts a full 32,768-byte window
+            // (RFC 7692 §7.1.2.2). Present-but-empty is arguably not legal at
+            // all — §7.1.2.2 gives the response-side parameter a `1*DIGIT`
+            // value, and §7 makes an invalid response value a client MUST-fail
+            // — so this arm knowingly tolerates a non-conforming response
+            // rather than reading a meaning into it.
+            ClientMaxWindowBits::Absent | ClientMaxWindowBits::NoValue => client_max_window_bits,
+            ClientMaxWindowBits::Bits(received) => {
+                // A value caps the window we compress with, and §7.1.2.2
+                // requires it be "equal to or smaller than the received
+                // value" — so an over-large one is invalid, which §7 makes a
+                // client MUST-fail. Hence the error rather than a clamp.
                 if !SUPPORTED_WINDOW_BITS.contains(&received) {
                     return Err(NegotiationError::UnsupportedClientMaxWindowBitsValue(
                         received.get(),
@@ -583,8 +494,13 @@ impl PermessageDeflateConfig {
 
         let max_window_bits = [
             server_max_window_bits.map(|bits| (SERVER_MAX_WINDOW_BITS, Some(bits.to_string()))),
-            client_max_window_bits
-                .map(|bits| (CLIENT_MAX_WINDOW_BITS, bits.as_ref().map(ToString::to_string))),
+            match client_max_window_bits {
+                ClientMaxWindowBits::Absent => None,
+                ClientMaxWindowBits::NoValue => Some((CLIENT_MAX_WINDOW_BITS, None)),
+                ClientMaxWindowBits::Bits(bits) => {
+                    Some((CLIENT_MAX_WINDOW_BITS, Some(bits.to_string())))
+                }
+            },
         ]
         .into_iter()
         .flatten();
@@ -606,7 +522,7 @@ impl PermessageDeflateConfig {
             server_no_context_takeover: false,
             client_no_context_takeover: false,
             server_max_window_bits: None,
-            client_max_window_bits: None,
+            client_max_window_bits: ClientMaxWindowBits::Absent,
         };
 
         fn apply<'a>(
@@ -629,39 +545,24 @@ impl PermessageDeflateConfig {
                 ParamName::MaxWindowBits(role) => {
                     let bits = value
                         .map(|bits| {
-                            // This is more lenient than the RFC allows in that
-                            // it will successfully parse an input with leading
-                            // zeros. This is in line with Postel's Law ("be
-                            // conservative in what you send, be liberal in what
-                            // you accept") and won't affect handling for an
-                            // RFC-compliant peer.
+                            // Deliberately lenient: leading zeros parse, which
+                            // the RFC disallows but no compliant peer sends.
                             bits.parse()
                                 .ok()
                                 .filter(|bits| ALLOWED_WINDOW_BITS.contains(bits))
                                 .ok_or(value)
                         })
                         .transpose()?;
+                    // The two are not symmetric: `server_max_window_bits` must
+                    // carry a value, `client_max_window_bits` may stand alone.
+                    // RFC 7692 §7.1.2.1, §7.1.2.2.
                     match role {
                         Role::Server => {
-                            // Per RFC 7692 Section 7.1.2.1:
-                            //
-                            //   A client MAY include the
-                            //   "server_max_window_bits" extension parameter in
-                            //   an extension negotiation offer.  This parameter
-                            //   has a decimal integer value without leading
-                            //   zeroes between 8 to 15, inclusive...
                             this.server_max_window_bits = Some(bits.ok_or(value)?);
                         }
                         Role::Client => {
-                            // Per RFC 7692 Section 7.1.2.2:
-                            //
-                            //      A client MAY include the
-                            //      "client_max_window_bits" extension parameter
-                            //      in an extension negotiation offer.  This
-                            //      parameter has no value or a decimal integer
-                            //      value without leading zeroes between 8 to 15
-                            //      inclusive...
-                            this.client_max_window_bits = Some(bits)
+                            this.client_max_window_bits =
+                                bits.map_or(ClientMaxWindowBits::NoValue, ClientMaxWindowBits::Bits)
                         }
                     };
                     Ok(())
@@ -760,6 +661,27 @@ mod test {
     use super::*;
 
     #[test]
+    fn deflate_config_parse_params_accepts_quoted_values() {
+        // A quoted value is legal per RFC 6455 §9.1. Rejecting it silently
+        // declined compression as a server and failed a legal handshake as a
+        // client, since both sides parse this value as an integer.
+        assert_eq!(
+            PermessageDeflateConfig::parse_params(
+                WebsocketProtocolExtension::from_str(
+                    "permessage-deflate; server_max_window_bits=\"10\"; client_max_window_bits=\"9\""
+                )
+                .unwrap()
+                .params()
+            ),
+            Ok(PermessageDeflateConfig {
+                server_max_window_bits: Some(10.try_into().unwrap()),
+                client_max_window_bits: ClientMaxWindowBits::Bits(9.try_into().unwrap()),
+                ..Default::default()
+            })
+        );
+    }
+
+    #[test]
     fn deflate_config_parse_params_valid() {
         assert_eq!(
             PermessageDeflateConfig::parse_params([]),
@@ -774,7 +696,7 @@ mod test {
                 .params()
             ),
             Ok(PermessageDeflateConfig {
-                client_max_window_bits: Some(Some(12.try_into().unwrap())),
+                client_max_window_bits: ClientMaxWindowBits::Bits(12.try_into().unwrap()),
                 server_no_context_takeover: true,
                 ..Default::default()
             })
@@ -845,13 +767,13 @@ mod test {
         const SMALLER_WINDOW: NonZeroU8 = unsafe { NonZeroU8::new_unchecked(12) };
         assert_eq!(
             server_config.accept_offer(PermessageDeflateConfig {
-                client_max_window_bits: Some(Some(SMALLER_WINDOW)),
+                client_max_window_bits: ClientMaxWindowBits::Bits(SMALLER_WINDOW),
                 ..Default::default()
             }),
             Some((
                 DeflateConfig { client_max_window_bits: SMALLER_WINDOW, ..server_config },
                 PermessageDeflateConfig {
-                    client_max_window_bits: Some(Some(SMALLER_WINDOW)),
+                    client_max_window_bits: ClientMaxWindowBits::Bits(SMALLER_WINDOW),
                     ..Default::default()
                 }
             ))
@@ -873,7 +795,7 @@ mod test {
             MODIFIERS
                 .iter()
                 .enumerate()
-                .filter(|(i, _)| (selector & (1 << i) != 0))
+                .filter(|(i, _)| selector & (1 << i) != 0)
                 .fold(DeflateConfig::new(), |config, (_, modifier)| modifier(config))
         }
 
@@ -905,7 +827,7 @@ mod test {
         const SMALLER_WINDOW: NonZeroU8 = unsafe { NonZeroU8::new_unchecked(12) };
         let server_response = PermessageDeflateConfig {
             server_max_window_bits: Some(*ALLOWED_WINDOW_BITS.end()),
-            client_max_window_bits: Some(Some(SMALLER_WINDOW)),
+            client_max_window_bits: ClientMaxWindowBits::Bits(SMALLER_WINDOW),
             ..Default::default()
         };
 
