@@ -44,23 +44,30 @@ where
     values
         .flat_map(|string| {
             let mut in_quotes = false;
+            let mut escaped = false;
             string
                 .split(move |c| {
-                    #[allow(clippy::collapsible_else_if)]
-                    if in_quotes {
-                        if c == '"' {
-                            in_quotes = false;
+                    if escaped {
+                        // RFC 7230 quoted-pair: the character after a backslash
+                        // is literal. Without this an escaped `"` closes the
+                        // quoted-string, and a delimiter later in the same value
+                        // splits it -- silently, on our own writer's output.
+                        escaped = false;
+                        false // dont split
+                    } else if in_quotes {
+                        match c {
+                            '\\' => escaped = true,
+                            '"' => in_quotes = false,
+                            _ => {}
                         }
                         false // dont split
+                    } else if c == delimiter {
+                        true // split
                     } else {
-                        if c == delimiter {
-                            true // split
-                        } else {
-                            if c == '"' {
-                                in_quotes = true;
-                            }
-                            false // dont split
+                        if c == '"' {
+                            in_quotes = true;
                         }
+                        false // dont split
                     }
                 })
                 .filter_map(|x| match x.trim() {

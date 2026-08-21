@@ -378,7 +378,20 @@ mod tests {
         // that level either way. The loss happens where `;` and `,` are
         // structural -- which is the header. Testing the param alone passes with
         // the re-quote removed, which is how this test was wrong first.
-        for value in [r#"a;b"#, "a,b", "a b", "with\"quote", "back\\slash", ""] {
+        // `a"b,c` and `a"b;c` carry a separator *after* an escaped quote, which
+        // is the only shape that reaches the splitter's escape handling: with
+        // `with"quote` the value ends before any separator, so the bug hid here
+        // for as long as this list did not contain both.
+        for value in [
+            r#"a;b"#,
+            "a,b",
+            "a b",
+            "with\"quote",
+            "back\\slash",
+            "a\"b,c",
+            "a\"b;c",
+            "",
+        ] {
             let original = SecWebsocketExtensions::new([WebsocketProtocolExtension::new(
                 "permessage-deflate",
                 [WebsocketExtensionParam::new("x", Some(value.to_owned()))],
