@@ -406,16 +406,8 @@ mod tests {
         // is the only shape that reaches the splitter's escape handling: with
         // `with"quote` the value ends before any separator, so the bug hid here
         // for as long as this list did not contain both.
-        for value in [
-            r#"a;b"#,
-            "a,b",
-            "a b",
-            "with\"quote",
-            "back\\slash",
-            "a\"b,c",
-            "a\"b;c",
-            "",
-        ] {
+        for value in [r#"a;b"#, "a,b", "a b", "with\"quote", "back\\slash", "a\"b,c", "a\"b;c", ""]
+        {
             let original = SecWebsocketExtensions::new([WebsocketProtocolExtension::new(
                 "permessage-deflate",
                 [WebsocketExtensionParam::new("x", Some(value.to_owned()))],
