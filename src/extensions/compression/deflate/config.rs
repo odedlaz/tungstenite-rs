@@ -73,7 +73,7 @@ pub enum NegotiationError {
 /// directive.
 #[derive(Debug, Error)]
 #[cfg_attr(test, derive(PartialEq))]
-pub(crate) enum ParameterError {
+pub enum ParameterError {
     /// Unknown parameter in a negotiation response.
     #[error("Unknown parameter in a negotiation response: {0}")]
     UnknownParameter(String),
@@ -82,7 +82,12 @@ pub(crate) enum ParameterError {
     DuplicateParameter(String),
     /// Parameter has an unexpected or invalid value.
     #[error("Invalid value {value} for parameter {name}")]
-    InvalidParameterValue { name: &'static str, value: String },
+    InvalidParameterValue {
+        /// The parameter whose value was rejected.
+        name: &'static str,
+        /// The value as it arrived, unparsed.
+        value: String,
+    },
 }
 
 /// Contents of a `permessage-deflate` Per-Message Compression Extension.
@@ -329,7 +334,13 @@ impl DeflateConfig {
     ///   server supports them.
     ///
     /// [RFC 7692 Section 5]: https://tools.ietf.org/html/rfc7692#section-5
-    pub(crate) fn accept_offer(
+    /// Decides a server's response to a client's `permessage-deflate` offer.
+    ///
+    /// Returns the configuration to run and the parameters to echo, or `None` to
+    /// decline. The server's own configuration acts as a floor: a flag set here
+    /// is imposed whether or not the client asked for it, and a window this
+    /// build cannot compress with is declined rather than silently widened.
+    pub fn accept_offer(
         &self,
         client: PermessageDeflateConfig,
     ) -> Option<(DeflateConfig, PermessageDeflateConfig)> {
@@ -434,7 +445,12 @@ impl DeflateConfig {
     /// configuration, with the response from the server as the argument. An
     /// `Ok` result will indicate the set of options the client should use for
     /// the remainder of the connection.
-    pub(crate) fn accept_response(
+    /// Checks a server's response against the offer a client sent.
+    ///
+    /// Returns the configuration to run, or an error if the response is not one
+    /// this client can honour — a parameter it never offered, or a window
+    /// outside what this build supports.
+    pub fn accept_response(
         self,
         server: PermessageDeflateConfig,
     ) -> Result<Self, NegotiationError> {
@@ -569,7 +585,13 @@ impl PermessageDeflateConfig {
     }
 
     /// Parses the extension parameter list for a `Sec-WebSocket-Extensions` header.
-    pub(crate) fn parse_params<'p>(
+    /// Parses an extension's parameter list into a validated configuration.
+    ///
+    /// The caller that owns the HTTP handshake needs this: it has the parameters
+    /// from a `Sec-WebSocket-Extensions` offer and has to turn them into
+    /// something it can decide on. Fields on the result are valid per RFC 7692
+    /// section 7.
+    pub fn parse_params<'p>(
         params: impl IntoIterator<Item = &'p WebsocketExtensionParam>,
     ) -> Result<Self, ParameterError> {
         let mut this = Self {

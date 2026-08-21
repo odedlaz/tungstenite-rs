@@ -9,7 +9,7 @@ use crate::{extensions::compression::DecompressionError, protocol::Role};
 
 mod config;
 #[cfg_attr(not(feature = "handshake"), allow(unused_imports))]
-pub(crate) use config::ParameterError as DeflateParameterError;
+pub use config::ParameterError as DeflateParameterError;
 pub use config::{
     DeflateConfig, NegotiationError as DeflateNegotiationError, PermessageDeflateConfig,
     PER_MESSAGE_DEFLATE as EXTENSION_NAME, SUPPORTED_WINDOW_BITS,

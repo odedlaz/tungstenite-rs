@@ -3,26 +3,22 @@ use std::{borrow::Cow, fmt::Debug, iter::FromIterator, str::FromStr};
 use bytes::BytesMut;
 use http::HeaderValue;
 
-use super::{from_comma_delimited, from_delimited};
+use super::{from_comma_delimited, from_delimited, MalformedExtensionsHeader};
 
 /// The `Sec-Websocket-Extensions` header.
 ///
 /// This header is used in the Websocket handshake, sent by the client to the
 /// server and then from the server to the client. It is a proposed and
 /// agreed-upon list of websocket protocol extensions to use.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
-/// The `Sec-WebSocket-Extensions` header, as a list of extension offers or a
-/// negotiated response.
 ///
 /// Parses and renders the grammar in RFC 6455 section 9.1: a comma-separated
 /// list of extensions, each with semicolon-separated parameters whose values are
 /// a `token` or a `quoted-string`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct SecWebsocketExtensions(Vec<WebsocketProtocolExtension>);
 
 /// An extension listed in a [`SecWebsocketExtensions`] header.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-/// One extension within a [`SecWebsocketExtensions`] header: a name and its
-/// parameters.
 pub struct WebsocketProtocolExtension {
     name: Cow<'static, str>,
     params: Vec<WebsocketExtensionParam>,
@@ -30,11 +26,6 @@ pub struct WebsocketProtocolExtension {
 
 /// Named parameter for an extension in a `Sec-Websocket-Extensions` header.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-/// One parameter of a [`WebsocketProtocolExtension`], such as
-/// `server_max_window_bits=10`.
-///
-/// A parameter may carry no value, which is how RFC 7692 spells the
-/// `*_no_context_takeover` flags.
 pub struct WebsocketExtensionParam {
     name: Cow<'static, str>,
     value: Option<String>,
@@ -51,14 +42,40 @@ impl SecWebsocketExtensions {
         self.into_iter()
     }
 
+    /// Parses the header from its raw values, joining list elements split
+    /// across several header lines as RFC 7230 permits.
+    ///
+    /// This is the parse entry point for a caller that owns the HTTP handshake
+    /// itself — a framework that has already read the request and needs to
+    /// answer an extension offer. The [`headers::Header`] implementation does
+    /// the same thing, but its error type would require depending on the
+    /// `headers` crate merely to handle a malformed header.
+    ///
+    /// Quoting is respected: a parameter value may be a `quoted-string`
+    /// containing `,` or `;` (RFC 6455 section 9.1), so the values must not be
+    /// split before reaching here.
+    pub fn from_header_values<'i, I>(values: I) -> Result<Self, MalformedExtensionsHeader>
+    where
+        I: IntoIterator<Item = &'i HeaderValue>,
+    {
+        from_comma_delimited(&mut values.into_iter()).map(Self)
+    }
+
     /// Returns the number of extensions in this header.
     #[inline]
-    /// The number of extensions in the header.
     pub fn len(&self) -> usize {
         self.0.len()
     }
 
     /// Returns a [`HeaderValue`] with the encoded contents of this header.
+    ///
+    /// # Panics
+    ///
+    /// If any extension or parameter name is not an RFC 7230 `token`, or a
+    /// parameter value contains bytes a header cannot carry. Quoting protects
+    /// parameter *values* with separators in them, but names are always written
+    /// bare, so a name containing `;` or `,` reparses as different structure.
+    /// Construct from parsed input, or from names you control.
     pub fn header_value(&self) -> HeaderValue {
         let extensions = CommaDelimited(self.0.as_slice());
         let mut buffer = BytesMut::with_capacity(extensions.encoded_len());
@@ -71,6 +88,9 @@ impl SecWebsocketExtensions {
 
 impl WebsocketProtocolExtension {
     /// Constructs a new extension directive with the given name and parameters.
+    /// `name` must be an RFC 7230 `token`: it is written bare, so a name
+    /// containing `;` or `,` reparses as different structure. Not checked here —
+    /// see [`SecWebsocketExtensions::header_value`].
     pub fn new(
         name: impl Into<Cow<'static, str>>,
         params: impl IntoIterator<Item = WebsocketExtensionParam>,
@@ -92,21 +112,21 @@ impl WebsocketProtocolExtension {
 impl WebsocketExtensionParam {
     /// Constructs a new parameter with the given name and optional value.
     #[inline]
-    /// Constructs a parameter, with a value or without one.
+    /// `name` must be an RFC 7230 `token`; a value needing quotes is quoted on
+    /// the way out. Neither is checked here — see
+    /// [`SecWebsocketExtensions::header_value`].
     pub fn new(name: impl Into<Cow<'static, str>>, value: Option<String>) -> Self {
         Self { name: name.into(), value }
     }
 
     /// The name of the parameter.
     #[inline]
-    /// The parameter name.
     pub fn name(&self) -> &str {
         &self.name
     }
 
     /// The parameter value, if there is one.
     #[inline]
-    /// The parameter value, or `None` for a valueless parameter.
     pub fn value(&self) -> Option<&str> {
         self.value.as_deref()
     }
@@ -121,7 +141,9 @@ impl headers::Header for SecWebsocketExtensions {
     where
         I: Iterator<Item = &'i HeaderValue>,
     {
-        from_comma_delimited(values).map(SecWebsocketExtensions)
+        // One implementation: this exists to satisfy the `headers` trait, and
+        // the parsing lives in the inherent method so the two cannot diverge.
+        Self::from_header_values(values.by_ref()).map_err(|_| headers::Error::invalid())
     }
     fn encode<E: Extend<headers::HeaderValue>>(&self, values: &mut E) {
         values.extend(std::iter::once(self.header_value()))
@@ -161,7 +183,7 @@ impl<'a> IntoIterator for &'a SecWebsocketExtensions {
 }
 
 impl FromStr for WebsocketProtocolExtension {
-    type Err = headers::Error;
+    type Err = MalformedExtensionsHeader;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let (name, tail) = s.split_once(';').map(|(n, t)| (n, Some(t))).unwrap_or((s, None));
