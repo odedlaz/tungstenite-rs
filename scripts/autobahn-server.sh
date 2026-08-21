@@ -7,7 +7,10 @@
 #
 #   set -e            exit 137 from `docker run` jumped straight to the EXIT trap,
 #                     so nothing could inspect the container afterwards
-#   --rm              the container was gone before .State.OOMKilled could be read
+#   --rm              the container was gone before .State.OOMKilled could be read.
+#                     Measured since: a host-level (CONSTRAINT_NONE) kill sets that
+#                     flag too, so it does not by itself mean a cgroup limit was hit
+#                     -- the kernel record below is what distinguishes them
 #   cargo run &       $! is the cargo wrapper, so `wait` proved nothing about the
 #                     Rust server and killing it could orphan the real listener
 #   block buffering   wstest's stdout flushed every ~103 cases, so the last case
@@ -24,6 +27,12 @@ MEMLOG=$(mktemp)
 # docker client and leaves the container itself running, so the postmortem can
 # tell a hang (still Running) from a kill (OOMKilled or a nonzero ExitCode).
 CLIENT_TIMEOUT=${CLIENT_TIMEOUT:-15m}
+# The kernel killed wstest at 14.9 GiB of anon-rss with constraint=CONSTRAINT_NONE,
+# i.e. the host ran out; the runner puts no cgroup limit on containers. A limit
+# here turns that into cgroup pressure, which can reclaim and swap instead of
+# killing. Whether the client then completes or dies at the cap is the question:
+# completing makes the fix one flag upstream, dying says it needs more than this.
+CLIENT_MEMORY=${CLIENT_MEMORY:-6g}
 
 function cleanup() {
     [ -n "${WSSERVER_PID:-}" ] && kill -9 "${WSSERVER_PID}" 2>/dev/null
@@ -65,6 +74,7 @@ SAMPLER_PID=$!
 # line, and .State.OOMKilled below covers exactly that case.
 # shellcheck disable=SC2016  # the inner quotes are the container shell's, not ours
 timeout "${CLIENT_TIMEOUT}" docker run --name "${CONTAINER}" \
+    --memory="${CLIENT_MEMORY}" \
     -e PYTHONUNBUFFERED=1 \
     -v "${PWD}/autobahn:/autobahn" \
     --network host \
