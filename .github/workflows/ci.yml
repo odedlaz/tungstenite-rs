@@ -83,13 +83,21 @@ jobs:
   autobahn:
     name: Autobahn tests
     runs-on: ubuntu-latest
+    # Scratch-branch diagnostic: the stock job inherits the 360-minute default,
+    # so the observed hangs cost hours. The script's own CLIENT_TIMEOUT fires
+    # first and keeps the container for the postmortem; this is the backstop.
+    timeout-minutes: 40
 
     strategy:
+      # One red arm in three is the observed rate, so a single green run proves
+      # nothing. `attempt` repeats the matrix to sample it.
+      fail-fast: false
       matrix:
         rust:
           - stable
           - beta
           - nightly
+        attempt: [1, 2, 3]
 
     steps:
       - name: Checkout sources
