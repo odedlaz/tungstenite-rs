@@ -54,9 +54,15 @@ default-features = false
 # the graph still takes precedence and is equally correct.
 #
 # The floor is 1.0.31, not 1.0.29. 1.0.29 is where the `zlib-rs` feature first
-# appears, but 1.0.29 and 1.0.30 pull zlib-rs 0.1.1, whose inflate stalls with
-# `BufError` when the output buffer refills -- so the feature builds and then
-# fails to decompress. 1.0.31 pulls zlib-rs 0.2.1 and passes.
+# appears, but 1.0.29 and 1.0.30 require `libz-rs-sys ^0.1.1` -- which on a 0.x
+# crate means `>=0.1.1, <0.2.0` -- and that line's inflate stalls with
+# `BufError` when the output buffer refills. So on those two versions the
+# feature has no working configuration at all: there is nothing to pin, because
+# the caret admits only the broken line. 1.0.31 requires `^0.2.1`; both ends of
+# that range are tested, 0.2.1 at this floor and 0.6.7 at the resolved 1.1.9.
+#
+# The failure has no compile-time signal -- it builds, then corrupts every
+# compressed message it receives -- so do not lower this floor.
 features = ["zlib-rs"]
 
 [dependencies.native-tls-crate]
