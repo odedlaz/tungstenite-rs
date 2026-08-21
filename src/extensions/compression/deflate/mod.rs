@@ -1,6 +1,8 @@
 //! Implements "permessage-deflate" PMCE defined in [RFC 7692 Section 7]
 //!
 //! [RFC 7692 Section 7]: https://tools.ietf.org/html/rfc7692#section-7
+use std::cmp::min;
+
 use bytes::Bytes;
 use flate2::{Compress, Decompress, FlushCompress, FlushDecompress, Status};
 use thiserror::Error;
@@ -267,10 +269,14 @@ impl DeflateDecompress {
         let mut decompress_from = |mut data: &[u8]| {
             loop {
                 // Make sure there's some space to decompress into,
-                // optimistically assuming a 50% compression ratio of the input.
-                // This might put us slightly beyond the requested size limit
-                // but it also might not all be used.
-                output.reserve(2 * data.len());
+                // optimistically assuming a 50% compression ratio of the input,
+                // but never reserve past the budget. The guess is keyed to the
+                // input, so an operator who lowers `max_message_size` to bound
+                // memory would still admit up to `2 * max_frame_size` of
+                // decompressed bytes in a single call before the check below
+                // runs. One byte past the budget is all that check needs.
+                let headroom = size_limit.saturating_sub(output.len()).saturating_add(1);
+                output.reserve(min(2 * data.len(), headroom));
 
                 let r =
                     self.decompressor.decompress_vec(data, &mut output, FlushDecompress::None)?;
@@ -288,8 +294,12 @@ impl DeflateDecompress {
                     Status::Ok => continue,
                     Status::BufError => {
                         // We've either run out of input data or output space.
-                        // Since we reserve space ahead of time, this must mean
-                        // we're out of input.
+                        // The reserve above is capped at the budget, so the
+                        // tightest it gets is one spare byte, at
+                        // `len == size_limit`. One byte is enough for
+                        // `decompress_vec` to make progress, which would push
+                        // `len` past the limit and error above rather than
+                        // arrive here. So this still means we're out of input.
                         break;
                     }
                     Status::StreamEnd => {
@@ -457,6 +467,44 @@ pub(crate) mod test {
                 (bytes, is_final)
             })
         }
+    }
+
+    /// A single frame built from repeated `very_compressed` blocks, plus the
+    /// trailing empty-block header byte `make_frames` puts on its final frame.
+    fn bomb_payload(copies: usize) -> Vec<u8> {
+        let mut payload = very_compressed::FRAME_PAYLOAD.repeat(copies);
+        payload.push(0x00);
+        payload
+    }
+
+    /// Input that would inflate a thousandfold, against a budget far below it.
+    /// The budget is enforced inside the inflate loop rather than after it, so
+    /// this errors within an iteration of crossing the limit instead of
+    /// materializing the payload first. The assertions cover the error and the
+    /// scale; that the process never grows to the inflated size is a property
+    /// only an external memory measurement can show.
+    #[test]
+    fn decompression_limit_stops_a_bomb_mid_stream() {
+        let _ = env_logger::try_init();
+
+        let mut context = DeflateContext::new(Role::Client, DeflateConfig::default());
+        assert_eq!(
+            context.decompress(&bomb_payload(20_000), true, 1 << 20),
+            Err(DecompressionError::SizeLimitReached)
+        );
+    }
+
+    /// The control the test above needs: without a budget the same fixture
+    /// really does inflate 776:1, so an implementation that checked the limit
+    /// only after inflating would have been caught rather than passing quietly.
+    #[test]
+    fn very_compressed_payload_inflates_fully_without_limit() {
+        let _ = env_logger::try_init();
+
+        let mut context = DeflateContext::new(Role::Client, DeflateConfig::default());
+        let out = context.decompress(&bomb_payload(2_000), true, usize::MAX).unwrap();
+        assert_eq!(out.len(), 2_000 * very_compressed::DECOMPRESSED_LEN);
+        assert!(out.iter().all(|b| *b == 0));
     }
 
     #[test]
