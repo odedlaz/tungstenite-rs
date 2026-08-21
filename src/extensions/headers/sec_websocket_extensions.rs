@@ -114,9 +114,17 @@ impl WebsocketProtocolExtension {
 impl WebsocketExtensionParam {
     /// Constructs a new parameter with the given name and optional value.
     ///
-    /// `name` must be an RFC 7230 `token`; a value needing quotes is quoted on
-    /// the way out. Neither is checked here — see
+    /// **Both** must be an RFC 7230 `token`, and neither is checked here — see
     /// [`SecWebsocketExtensions::header_value`].
+    ///
+    /// The value too, because RFC 6455 §9.1's ABNF says the `quoted-string` form
+    /// must unescape *to* a token. A token contains no character that would need
+    /// quoting, so the quoted form is only ever a redundant encoding, and a value
+    /// that genuinely needs it is not legal in this header. Such a value is still
+    /// quoted on the way out rather than rejected, which keeps this constructor
+    /// infallible — but the result is a header §9.1 obliges a conforming peer to
+    /// fail the connection over. Nothing in this crate produces one: every
+    /// parameter it writes is a name from a fixed set or a small integer.
     #[inline]
     pub fn new(name: impl Into<Cow<'static, str>>, value: Option<String>) -> Self {
         Self { name: name.into(), value }
