@@ -86,11 +86,10 @@ pub(crate) enum ParameterError {
 /// Contents of a `permessage-deflate` Per-Message Compression Extension.
 ///
 /// This represents the contents of a valid `permessage-deflate` directive found
-/// in a `Sec-WebSocket-Extensions` header. Instances of this type can be
-/// produced by parsing a sequence of [`WebsocketExtensionParam`]s with
-/// [`PermessageDeflateConfig::parse_params`] or with the [`Default`]
-/// implementation. Consuming code can assume the fields here are valid
-/// according to [RFC 7692 Section 7].
+/// in a `Sec-WebSocket-Extensions` header. Instances are produced by this
+/// crate while parsing such a header, or by the [`Default`] implementation.
+/// Consuming code can assume the fields here are valid according to
+/// [RFC 7692 Section 7].
 ///
 /// [RFC 7692 Section 7]: https://tools.ietf.org/html/rfc7692#section-7
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
