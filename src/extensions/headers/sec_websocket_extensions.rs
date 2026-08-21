@@ -3,13 +3,17 @@ use std::{borrow::Cow, fmt::Debug, iter::FromIterator, str::FromStr};
 use bytes::BytesMut;
 use http::HeaderValue;
 
-use super::{from_comma_delimited, from_delimited};
+use super::{from_comma_delimited, from_delimited, MalformedExtensionsHeader};
 
 /// The `Sec-Websocket-Extensions` header.
 ///
 /// This header is used in the Websocket handshake, sent by the client to the
 /// server and then from the server to the client. It is a proposed and
 /// agreed-upon list of websocket protocol extensions to use.
+///
+/// Parses and renders the grammar in RFC 6455 section 9.1: a comma-separated
+/// list of extensions, each with semicolon-separated parameters whose values are
+/// a `token` or a `quoted-string`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct SecWebsocketExtensions(Vec<WebsocketProtocolExtension>);
 
@@ -38,6 +42,25 @@ impl SecWebsocketExtensions {
         self.into_iter()
     }
 
+    /// Parses the header from its raw values, joining list elements split
+    /// across several header lines as RFC 7230 permits.
+    ///
+    /// This is the parse entry point for a caller that owns the HTTP handshake
+    /// itself — a framework that has already read the request and needs to
+    /// answer an extension offer. The [`headers::Header`] implementation does
+    /// the same thing, but its error type would require depending on the
+    /// `headers` crate merely to handle a malformed header.
+    ///
+    /// Quoting is respected: a parameter value may be a `quoted-string`
+    /// containing `,` or `;` (RFC 6455 section 9.1), so the values must not be
+    /// split before reaching here.
+    pub fn from_header_values<'i, I>(values: I) -> Result<Self, MalformedExtensionsHeader>
+    where
+        I: IntoIterator<Item = &'i HeaderValue>,
+    {
+        from_comma_delimited(&mut values.into_iter()).map(Self)
+    }
+
     /// Returns the number of extensions in this header.
     #[inline]
     pub fn len(&self) -> usize {
@@ -45,6 +68,15 @@ impl SecWebsocketExtensions {
     }
 
     /// Returns a [`HeaderValue`] with the encoded contents of this header.
+    ///
+    /// # Panics
+    ///
+    /// If a name or value contains bytes a header cannot carry — a newline, say.
+    ///
+    /// Not on a name that is merely not a `token`: quoting protects parameter
+    /// *values*, names are written bare, so `x;y` re-reads as extension `x` with
+    /// an extra parameter and `x,y` as two extensions. Construct from parsed
+    /// input, or from names you control — see [`WebsocketExtensionParam::new`].
     pub fn header_value(&self) -> HeaderValue {
         let extensions = CommaDelimited(self.0.as_slice());
         let mut buffer = BytesMut::with_capacity(extensions.encoded_len());
@@ -57,6 +89,8 @@ impl SecWebsocketExtensions {
 
 impl WebsocketProtocolExtension {
     /// Constructs a new extension directive with the given name and parameters.
+    /// `name` must be a `token` and is not checked here — see
+    /// [`WebsocketExtensionParam::new`].
     pub fn new(
         name: impl Into<Cow<'static, str>>,
         params: impl IntoIterator<Item = WebsocketExtensionParam>,
@@ -77,6 +111,23 @@ impl WebsocketProtocolExtension {
 
 impl WebsocketExtensionParam {
     /// Constructs a new parameter with the given name and optional value.
+    ///
+    /// **Both** must be a `token`, and neither is checked here — see
+    /// [`SecWebsocketExtensions::header_value`].
+    ///
+    /// The rule for the value, in the RFC's own terms: RFC 6455 §9.1 allows
+    /// `token | quoted-string` and then requires that "the value after
+    /// quoted-string unescaping MUST conform to the 'token' ABNF" — RFC 2616's
+    /// `token`, which excludes every separator. The same set as the RFC 7230
+    /// `tchar` this crate tests against; both admit exactly the printable ASCII
+    /// outside `"(),/:;<=>?@[\]{}`.
+    ///
+    /// The consequence is easy to miss: since a token contains nothing that would
+    /// need quoting, the `quoted-string` form is only ever a redundant encoding,
+    /// and a value that genuinely needs it is not legal here at all. Such a value
+    /// is quoted on the way out rather than rejected, which keeps this
+    /// constructor infallible — but the result is a header §9.1 obliges a
+    /// conforming peer to fail the connection over.
     #[inline]
     pub fn new(name: impl Into<Cow<'static, str>>, value: Option<String>) -> Self {
         Self { name: name.into(), value }
@@ -104,7 +155,9 @@ impl headers::Header for SecWebsocketExtensions {
     where
         I: Iterator<Item = &'i HeaderValue>,
     {
-        from_comma_delimited(values).map(SecWebsocketExtensions)
+        // One implementation: this exists to satisfy the `headers` trait, and
+        // the parsing lives in the inherent method so the two cannot diverge.
+        Self::from_header_values(values.by_ref()).map_err(|_| headers::Error::invalid())
     }
     fn encode<E: Extend<headers::HeaderValue>>(&self, values: &mut E) {
         values.extend(std::iter::once(self.header_value()))
@@ -144,7 +197,7 @@ impl<'a> IntoIterator for &'a SecWebsocketExtensions {
 }
 
 impl FromStr for WebsocketProtocolExtension {
-    type Err = headers::Error;
+    type Err = MalformedExtensionsHeader;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let (name, tail) = s.split_once(';').map(|(n, t)| (n, Some(t))).unwrap_or((s, None));
@@ -209,13 +262,41 @@ fn unquote(value: &str) -> String {
     unescaped
 }
 
+/// Re-applies the `quoted-string` form when a value cannot be written bare.
+///
+/// RFC 6455 section 9.1 allows an extension parameter value to be a `token` or a
+/// `quoted-string`. [`unquote`] accepts either, so without the mirror here a
+/// value that arrived quoted is re-emitted bare — and one containing `;` or `,`
+/// then reads as a parameter or extension boundary to the next parser, which is
+/// structure loss rather than a formatting difference.
+fn quote_if_needed(value: &str) -> std::borrow::Cow<'_, str> {
+    // RFC 7230 `tchar`. Anything outside it, including an empty value, needs the
+    // quoted form.
+    let is_token = !value.is_empty()
+        && value.bytes().all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b));
+    if is_token {
+        return std::borrow::Cow::Borrowed(value);
+    }
+
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('"');
+    for c in value.chars() {
+        if c == '"' || c == '\\' {
+            quoted.push('\\');
+        }
+        quoted.push(c);
+    }
+    quoted.push('"');
+    std::borrow::Cow::Owned(quoted)
+}
+
 impl std::fmt::Display for WebsocketExtensionParam {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let Self { name, value } = self;
 
         write!(f, "{name}")?;
         if let Some(value) = value {
-            write!(f, "={value}")?;
+            write!(f, "={}", quote_if_needed(value))?;
         }
         Ok(())
     }
@@ -258,7 +339,10 @@ impl WriteTo for WebsocketExtensionParam {
 
         if let Some(value) = value {
             write(b"=");
-            write(value.as_bytes());
+            // This is the path `header_value` uses, so the quoting has to happen
+            // here and not only in `Display`. `encoded_len` is derived from this
+            // same walk, so the length follows the quoting automatically.
+            write(quote_if_needed(value).as_bytes());
         }
     }
 }
@@ -301,6 +385,51 @@ impl<T: WriteTo, const N: usize> WriteTo for CommaDelimited<[T; N]> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_param_value_needing_quotes_round_trips_through_the_header() {
+        // Must go through the whole header, not a lone param: `FromStr` for a
+        // single param splits only on the first `=`, so `x=a;b` round-trips at
+        // that level either way. The loss happens where `;` and `,` are
+        // structural -- which is the header. Testing the param alone passes with
+        // the re-quote removed, which is how this test was wrong first.
+        // `a"b,c` and `a"b;c` carry a separator *after* an escaped quote, which
+        // is the only shape that reaches the splitter's escape handling: with
+        // `with"quote` the value ends before any separator, so the bug hid here
+        // for as long as this list did not contain both.
+        for value in [
+            r#"a;b"#,
+            "a,b",
+            "a b",
+            "with\"quote",
+            "back\\slash",
+            "a\"b,c",
+            "a\"b;c",
+            "",
+        ] {
+            let original = SecWebsocketExtensions::new([WebsocketProtocolExtension::new(
+                "permessage-deflate",
+                [WebsocketExtensionParam::new("x", Some(value.to_owned()))],
+            )]);
+
+            let rendered = original.header_value();
+            let reparsed = SecWebsocketExtensions::decode(&mut [rendered.clone()].iter())
+                .unwrap_or_else(|e| panic!("our own header must parse: {rendered:?}: {e}"));
+
+            assert_eq!(
+                reparsed, original,
+                "value {value:?} rendered as {rendered:?} and did not survive the header"
+            );
+        }
+    }
+
+    #[test]
+    fn a_token_value_is_still_written_bare() {
+        // The common case must not gain quotes: every consumer parses these as
+        // integers and a quoted form would be a gratuitous wire change.
+        let param = WebsocketExtensionParam::new("server_max_window_bits", Some("10".to_owned()));
+        assert_eq!(param.to_string(), "server_max_window_bits=10");
+    }
+
     use headers::{Header, HeaderMapExt as _};
 
     use super::*;
