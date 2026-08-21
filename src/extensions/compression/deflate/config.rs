@@ -262,9 +262,7 @@ impl DeflateConfig {
     /// zlib-rs backend only `debug_assert!`s the range, so an out-of-range
     /// level is silent in a release build.
     ///
-    /// This setting is local. It never appears in a negotiation offer or
-    /// response, so unlike the window and takeover knobs it carries no protocol
-    /// risk and needs no agreement from the peer.
+    /// Local only — it never appears in a negotiation offer or response.
     ///
     /// [`compression`]: DeflateConfig::compression
     #[inline]
@@ -402,17 +400,11 @@ impl DeflateConfig {
                 // The client supports the parameter so we can use our configured value.
                 client_max_window_bits
             }
-            // No lower bound: this caps the *client's* compressor and the
-            // server only inflates with it, which is correct at any window at
-            // least as large — `DeflateContext::new` raises the inflate window
-            // to the smallest flate2 accepts, so 8 costs nothing to accept.
+            // No lower bound — the peer's compressor, which we only inflate with.
             ClientMaxWindowBits::Bits(client_max) => client_max.min(client_max_window_bits),
         };
 
-        // Mirror of the pair in `accept_response`, with the roles swapped:
-        // `server_max_window_bits` is our own compressor here and has to be one
-        // we can deflate with, `client_max_window_bits` is the peer's and any
-        // legal value is fine.
+        // Server side of the invariant on the fields; `accept_response` asserts the other.
         debug_assert!(SUPPORTED_WINDOW_BITS.contains(&server_max_window_bits));
         debug_assert!(ALLOWED_WINDOW_BITS.contains(&client_max_window_bits));
 
@@ -491,11 +483,8 @@ impl DeflateConfig {
                 return Err(NegotiationError::InvalidServerMaxWindowBitsValue(received.get()));
             }
 
-            // No lower bound: this value is the *server's* compressor window
-            // and we only inflate with it, which is correct at any window at
-            // least as large — `DeflateContext::new` raises it to the smallest
-            // flate2 accepts. Recording it unclamped keeps this equal to what
-            // was negotiated, which is what RFC 7692 §7.1.2.1 defines.
+            // No lower bound — the peer's compressor. Recorded unclamped so this
+            // equals what was negotiated, which is what RFC 7692 §7.1.2.1 defines.
             received
         };
 
@@ -529,9 +518,7 @@ impl DeflateConfig {
             }
         };
 
-        // `server_max_window_bits` is the peer's compressor here, so any legal
-        // value is fine; `client_max_window_bits` is ours and has to be one we
-        // can actually compress with.
+        // Client side of the same invariant.
         debug_assert!(ALLOWED_WINDOW_BITS.contains(&server_max_window_bits));
         debug_assert!(SUPPORTED_WINDOW_BITS.contains(&client_max_window_bits));
 
@@ -770,30 +757,14 @@ mod test {
     }
 
     #[test]
-    fn accept_response_allows_server_window_bits_below_supported() {
-        // `server_max_window_bits` constrains the *server's* compressor, so the
-        // client only inflates with it. 8 is legal per RFC 7692 §7.1.2.1 and a
-        // conforming server may send it even unprompted, so a client that fails
-        // the handshake over it kills a valid connection.
-        let client = DeflateConfig::new();
-        let response = PermessageDeflateConfig {
-            server_max_window_bits: Some(8.try_into().unwrap()),
-            ..Default::default()
-        };
-
-        let agreed = client.accept_response(response).expect("8 is a legal server window");
-        assert_eq!(agreed.server_max_window_bits().get(), 8);
-    }
-
-    #[test]
     fn agreed_eight_bit_peer_window_inflates() {
-        // The point of accepting 8: our own context must not panic in
-        // `Decompress::new_with_window_bits`, and must still inflate the peer's
-        // stream. The peer here compresses at 9 because that is what a C zlib
-        // server actually emits for a requested 8 — `deflateInit2` promotes it —
-        // and because flate2 panics below 9 on the compressor side too, so no
-        // flate2 peer can produce a true 8-bit stream. Negotiation keeps our own
-        // compressor at or above 9 for exactly that reason.
+        // `server_max_window_bits` is the server's compressor, so a client only
+        // inflates with it: 8 is legal (RFC 7692 §7.1.2.1) and a conforming
+        // server may send it unprompted, so refusing kills a valid connection.
+        // Accepting is safe only because `DeflateContext::new` clamps — both
+        // `Decompress::new_with_window_bits` and its compress twin assert
+        // 9..=15, which is also why the peer below compresses at 9 and why
+        // negotiation keeps our own compressor there.
         let client = DeflateConfig::new();
         let agreed = client
             .accept_response(PermessageDeflateConfig {
@@ -803,8 +774,6 @@ mod test {
             .expect("8 is a legal server window");
         assert_eq!(agreed.server_max_window_bits().get(), 8);
 
-        // Must not panic: `Decompress::new_with_window_bits` rejects 8, so the
-        // clamp in `DeflateContext::new` is what makes this constructible.
         let mut us =
             crate::extensions::compression::deflate::DeflateContext::new(Role::Client, agreed);
 

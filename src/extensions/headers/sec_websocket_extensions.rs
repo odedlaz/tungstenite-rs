@@ -73,11 +73,10 @@ impl SecWebsocketExtensions {
     ///
     /// If a name or value contains bytes a header cannot carry — a newline, say.
     ///
-    /// It does **not** panic on a name that is merely not an RFC 7230 `token`.
-    /// Quoting protects parameter *values*; names are written bare, so such a
-    /// name changes the structure silently and differently per separator:
-    /// `x;y` re-reads as extension `x` with an extra parameter, `x,y` as two
-    /// extensions. Construct from parsed input, or from names you control.
+    /// Not on a name that is merely not a `token`: quoting protects parameter
+    /// *values*, names are written bare, so `x;y` re-reads as extension `x` with
+    /// an extra parameter and `x,y` as two extensions. Construct from parsed
+    /// input, or from names you control — see [`WebsocketExtensionParam::new`].
     pub fn header_value(&self) -> HeaderValue {
         let extensions = CommaDelimited(self.0.as_slice());
         let mut buffer = BytesMut::with_capacity(extensions.encoded_len());
@@ -90,9 +89,8 @@ impl SecWebsocketExtensions {
 
 impl WebsocketProtocolExtension {
     /// Constructs a new extension directive with the given name and parameters.
-    /// `name` must be an RFC 7230 `token`: it is written bare, so a name
-    /// containing `;` or `,` reparses as different structure. Not checked here —
-    /// see [`SecWebsocketExtensions::header_value`].
+    /// `name` must be a `token` and is not checked here — see
+    /// [`WebsocketExtensionParam::new`].
     pub fn new(
         name: impl Into<Cow<'static, str>>,
         params: impl IntoIterator<Item = WebsocketExtensionParam>,
@@ -129,9 +127,7 @@ impl WebsocketExtensionParam {
     /// and a value that genuinely needs it is not legal here at all. Such a value
     /// is quoted on the way out rather than rejected, which keeps this
     /// constructor infallible — but the result is a header §9.1 obliges a
-    /// conforming peer to fail the connection over. Nothing in this crate
-    /// produces one: every parameter it writes is a name from a fixed set or a
-    /// small integer.
+    /// conforming peer to fail the connection over.
     #[inline]
     pub fn new(name: impl Into<Cow<'static, str>>, value: Option<String>) -> Self {
         Self { name: name.into(), value }
