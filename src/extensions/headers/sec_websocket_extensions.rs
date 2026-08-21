@@ -71,11 +71,13 @@ impl SecWebsocketExtensions {
     ///
     /// # Panics
     ///
-    /// If any extension or parameter name is not an RFC 7230 `token`, or a
-    /// parameter value contains bytes a header cannot carry. Quoting protects
-    /// parameter *values* with separators in them, but names are always written
-    /// bare, so a name containing `;` or `,` reparses as different structure.
-    /// Construct from parsed input, or from names you control.
+    /// If a name or value contains bytes a header cannot carry — a newline, say.
+    ///
+    /// It does **not** panic on a name that is merely not an RFC 7230 `token`.
+    /// Quoting protects parameter *values*; names are written bare, so such a
+    /// name changes the structure silently and differently per separator:
+    /// `x;y` re-reads as extension `x` with an extra parameter, `x,y` as two
+    /// extensions. Construct from parsed input, or from names you control.
     pub fn header_value(&self) -> HeaderValue {
         let extensions = CommaDelimited(self.0.as_slice());
         let mut buffer = BytesMut::with_capacity(extensions.encoded_len());
@@ -111,10 +113,11 @@ impl WebsocketProtocolExtension {
 
 impl WebsocketExtensionParam {
     /// Constructs a new parameter with the given name and optional value.
-    #[inline]
+    ///
     /// `name` must be an RFC 7230 `token`; a value needing quotes is quoted on
     /// the way out. Neither is checked here — see
     /// [`SecWebsocketExtensions::header_value`].
+    #[inline]
     pub fn new(name: impl Into<Cow<'static, str>>, value: Option<String>) -> Self {
         Self { name: name.into(), value }
     }
