@@ -641,7 +641,7 @@ mod tests {
             host = "localhost",
             key = key
         );
-        assert_eq!(String::try_from(request).unwrap(), &correct[..]);
+        assert_eq!(String::from_utf8(request).unwrap(), &correct[..]);
     }
 
     #[test]
