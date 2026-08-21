@@ -82,6 +82,7 @@ timeout "${CLIENT_TIMEOUT}" docker run --name "${CONTAINER}" \
     crossbario/autobahn-testsuite \
     -c 'wstest -m fuzzingclient -s autobahn/fuzzingclient.json; rc=$?;
         echo "CGROUP_MEMORY_PEAK_BYTES=$(cat /sys/fs/cgroup/memory.peak 2>/dev/null || echo unavailable)";
+        echo "CGROUP_MEMORY_EVENTS=$(tr "\n" " " < /sys/fs/cgroup/memory.events 2>/dev/null || echo unavailable)";
         exit $rc'
 CLIENT_STATUS=$?
 kill "${SAMPLER_PID}" 2>/dev/null
@@ -97,6 +98,11 @@ SERVER_ALIVE=no; kill -0 "${WSSERVER_PID}" 2>/dev/null && SERVER_ALIVE=yes
       'container Running: {{.State.Running}}  OOMKilled: {{.State.OOMKilled}}  ExitCode: {{.State.ExitCode}}  Error: {{.State.Error}}'
   echo "--- container memory samples ---"
   cat "${MEMLOG}"
+  echo "--- per-case verdicts recorded before the run ended, by group ---"
+  jq -r '[input_filename, .behavior] | @tsv' autobahn/server/tungstenite_case_*.json 2>/dev/null \
+      | sed -E 's#.*tungstenite_case_([0-9]+)_([0-9]+)_?[0-9]*\.json#\1.\2#' \
+      | sort | uniq -c | sort -k2,2V \
+      || echo 'no per-case reports on disk'
   echo "--- kernel OOM record, if the runner exposes one ---"
   sudo dmesg 2>/dev/null | grep -iE 'out of memory|oom-kill|killed process' | tail -20 || echo 'dmesg unavailable'
   echo "=== end postmortem ==="

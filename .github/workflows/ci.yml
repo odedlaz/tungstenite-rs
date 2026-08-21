@@ -113,3 +113,16 @@ jobs:
 
       - name: Running Autobahn TestSuite for server
         run: ./scripts/autobahn-server.sh
+
+      # The per-case reports are written into the mounted volume as the suite
+      # runs, so a killed client leaves its verdicts on disk even though
+      # index.json never gets written. `always()` is the point: the arms worth
+      # reading are the ones that failed.
+      - name: Preserve the Autobahn reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: autobahn-reports-${{ matrix.rust }}-${{ matrix.attempt }}
+          path: autobahn/server/
+          if-no-files-found: warn
+          retention-days: 7
