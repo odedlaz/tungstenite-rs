@@ -5,6 +5,7 @@ use std::{
     marker::PhantomData,
 };
 
+#[cfg(feature = "deflate")]
 use headers::{Header, HeaderMapExt};
 use http::{
     header::HeaderName, HeaderMap, Request as HttpRequest, Response as HttpResponse, StatusCode,
@@ -18,9 +19,11 @@ use super::{
     machine::{HandshakeMachine, StageResult, TryParse},
     HandshakeRole, MidHandshake, ProcessingResult,
 };
+#[cfg(feature = "deflate")]
+use crate::extensions::headers::SecWebsocketExtensions;
 use crate::{
     error::{Error, ProtocolError, Result, SubProtocolError, UrlError},
-    extensions::{headers::SecWebsocketExtensions, Extensions, ExtensionsConfig},
+    extensions::{Extensions, ExtensionsConfig},
     handshake::version_as_str,
     protocol::{Role, WebSocket, WebSocketConfig},
 };
@@ -174,6 +177,7 @@ pub fn generate_request(
         .unwrap();
     }
 
+    #[cfg(feature = "deflate")]
     if let Some(header) = extensions
         .map(ExtensionsConfig::generate_offers)
         .map(SecWebsocketExtensions::new)
@@ -181,6 +185,8 @@ pub fn generate_request(
     {
         headers.append(SecWebsocketExtensions::name(), header.header_value());
     }
+    #[cfg(not(feature = "deflate"))]
+    let _ = extensions;
 
     // Now we must ensure that the headers that we've written once are not anymore present in the map.
     // If they do, then the request is invalid (some headers are duplicated there for some reason).
@@ -287,17 +293,29 @@ impl VerifyData {
         // that was not present in the client's handshake (the server has
         // indicated an extension not requested by the client), the client
         // MUST _Fail the WebSocket Connection_. (RFC 6455)
-        let extensions_header =
-            headers.typed_try_get::<SecWebsocketExtensions>().map_err(|_| {
-                ProtocolError::InvalidHeader(SecWebsocketExtensions::name().clone().into())
-            })?;
+        // Without a PMCE compiled in there is nothing to verify an agreement
+        // against, so the header is ignored exactly as upstream ignores it.
+        #[cfg(feature = "deflate")]
+        let extensions = {
+            let extensions_header =
+                headers.typed_try_get::<SecWebsocketExtensions>().map_err(|_| {
+                    ProtocolError::InvalidHeader(SecWebsocketExtensions::name().clone().into())
+                })?;
 
-        let extensions = match extensions_header {
-            None => Extensions::default(),
-            Some(agreed) => extensions
-                .ok_or(ProtocolError::InvalidHeader(SecWebsocketExtensions::name().clone().into()))?
-                .verify_agreed_on(agreed)
-                .map_err(ProtocolError::from)?,
+            match extensions_header {
+                None => Extensions::default(),
+                Some(agreed) => extensions
+                    .ok_or(ProtocolError::InvalidHeader(
+                        SecWebsocketExtensions::name().clone().into(),
+                    ))?
+                    .verify_agreed_on(agreed)
+                    .map_err(ProtocolError::from)?,
+            }
+        };
+        #[cfg(not(feature = "deflate"))]
+        let extensions = {
+            let _ = extensions;
+            Extensions::default()
         };
 
         // 6.  If the response includes a |Sec-WebSocket-Protocol| header field
@@ -483,7 +501,7 @@ mod tests {
         request.headers_mut().insert("X-City", non_ascii_value);
 
         // This should succeed, not fail with UTF-8 error
-        let result = generate_request(request);
+        let result = generate_request(request, None);
         assert!(result.is_ok(), "generate_request should accept non-ASCII header values");
 
         let (req_bytes, _key) = result.unwrap();
@@ -508,7 +526,7 @@ mod tests {
         request.headers_mut().insert("X-Test", latin1_value);
 
         // This should succeed
-        let result = generate_request(request);
+        let result = generate_request(request, None);
         assert!(result.is_ok(), "generate_request should accept Latin-1 header values");
 
         let (req_bytes, _key) = result.unwrap();

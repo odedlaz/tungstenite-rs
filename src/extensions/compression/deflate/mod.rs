@@ -66,21 +66,9 @@ impl DeflateContext {
             ..
         } = config;
 
-        // Per RFC 7692 Section 7:
-        //
-        //      These parameters enable two methods (no_context_takeover and
-        //      max_window_bits) of constraining memory usage that may be
-        //      applied independently to either direction of WebSocket traffic.
-        //      The extension parameters with the "client_" prefix are used by
-        //      the client to configure its compressor and by the server to
-        //      configure its decompressor.  The extension parameters with the
-        //      "server_" prefix are used by the server to configure its
-        //      compressor and by the client to configure its decompressor.  All
-        //      four parameters are defined for both a client's extension
-        //      negotiation offer and a server's extension negotiation response.
-        //
-        // Here `role` is for our own end of the connection, as opposed to the
-        // peer end.
+        // The `client_`/`server_` parameters are per direction, so each side
+        // reads its own prefix for compression and the peer's for
+        // decompression (RFC 7692 §7). `role` below is our own end.
         let (own_no_context_takeover, peer_no_context_takeover) = match role {
             Role::Client => (client_no_context_takeover, server_no_context_takeover),
             Role::Server => (server_no_context_takeover, client_no_context_takeover),
@@ -163,14 +151,6 @@ impl DeflateCompress {
         // attempting to compress data into it.
         const REQUIRED_OUTPUT_SPACE: usize = 4096;
 
-        // Per RFC 7692 Section 7.2.1:
-        //
-        //     An endpoint uses the following algorithm to compress a message.
-        //
-        //     1.  Compress all the octets of the payload of the message using
-        //         DEFLATE.
-        //
-
         {
             let mut total_read = self.compressor.total_in();
             loop {
@@ -208,30 +188,16 @@ impl DeflateCompress {
 
         log::trace!("flushing compressed data");
 
-        //     2.  If the resulting data does not end with an empty DEFLATE
-        //         block with no compression (the "BTYPE" bits are set to 00),
-        //         append an empty DEFLATE block with no compression to the tail
-        //         end.
-
-        // Ideally, at this point, we'd be able to just call compress_vec once
-        // with an empty slice, FlushCompress::Sync, and a vector with more than
-        // enough output space, and then we'd get an empty block and be done.
-        // After all, compress_vec is documented to output "as much output as
-        // possible".  Unfortunately, compress_vec does not actually do that for
-        // all backends. See:
+        // RFC 7692 §7.2.1 step 2 wants the payload to end with an empty
+        // uncompressed block, which step 3 then truncates off. One
+        // `compress_vec` with an empty slice ought to emit it — it is
+        // documented to write "as much output as possible" — but some backends
+        // return `Ok` as soon as *any* output is written, so loop until it
+        // stops making progress. The loop can go once that contradiction is
+        // fixed:
+        // - https://github.com/Frommi/miniz_oxide/issues/105
         // - https://github.com/rust-lang/flate2-rs/blob/1.1.2/src/ffi/rust.rs#L169
         // - https://github.com/Frommi/miniz_oxide/blob/0.8.8/miniz_oxide/src/deflate/stream.rs#L82
-        // - https://github.com/Frommi/miniz_oxide/issues/105
-        //
-        // This causes compress_vec to return Ok as soon as the compressor
-        // writes *any* output when called with an empty slice.
-        //
-        // So, instead, we need to keep calling compress_vec with an empty slice
-        // until we stop making progress.
-        //
-        // Once we have done that properly, we should always have an empty block
-        // at the end of the output, and then we can truncate the output to
-        // remove the empty block, per the RFC.
         {
             let mut total_out = self.compressor.total_out();
             loop {
@@ -251,10 +217,8 @@ impl DeflateCompress {
             }
         }
 
-        //     3.  Remove 4 octets (that are 0x00 0x00 0xff 0xff) from the tail
-        //         end.  After this step, the last octet of the compressed data
-        //         contains (possibly part of) the DEFLATE header bits with the
-        //         "BTYPE" bits set to 00.
+        // RFC 7692 §7.2.1 step 3: remove the trailing 0x00 0x00 0xff 0xff, so
+        // the last octet holds DEFLATE header bits with BTYPE set to 00.
 
         debug_assert!(output.ends_with(ELIDED_TRAILER_BLOCK_CONTENTS), "output is {output:02x?}");
         output.truncate(output.len() - ELIDED_TRAILER_BLOCK_CONTENTS.len());
@@ -284,14 +248,8 @@ impl DeflateDecompress {
         is_final: bool,
         size_limit: usize,
     ) -> Result<Bytes, DecompressionError<std::io::Error>> {
-        // From RFC 7692 Section 7.2.2:
-        //
-        //   An endpoint uses the following algorithm to decompress a message.
-        //
-        //   1.  Append 4 octets of 0x00 0x00 0xff 0xff to the tail end of the
-        //       payload of the message.
-        //
-        //   2.  Decompress the resulting data using DEFLATE.
+        // RFC 7692 §7.2.2: append 0x00 0x00 0xff 0xff — the empty block the
+        // sender truncated — then inflate.
 
         let mut output = Vec::new();
 
@@ -331,23 +289,14 @@ impl DeflateDecompress {
                         break;
                     }
                     Status::StreamEnd => {
-                        // Finished a block with BFINAL set. This is legal; from
-                        // RFC 7692 Section 7.2.3.4:
-                        //
-                        //   On platforms on which the flush method using an
-                        //   empty DEFLATE block with no compression is not
-                        //   available, implementors can choose to flush data
-                        //   using DEFLATE blocks with "BFINAL" set to 1.
-                        //
-                        // On the decompression end we reset the compressor in
-                        // response. This relies on the assumption that the
-                        // client produced the block with BFINAL set by
-                        // informing their compressor that the stream was
-                        // ending, and so any blocks afterwards won't reference
-                        // any context from this block or earlier. It's
-                        // obviously not a perfect assumption, but it matches
-                        // the behavior of other widely-deployed
-                        // permessage-deflate implementations.
+                        // A peer without an empty-block flush may set BFINAL
+                        // instead (RFC 7692 §7.2.3.4). `reset` discards the
+                        // whole sliding window, which is only safe if the peer
+                        // set BFINAL by telling its own compressor the stream
+                        // was ending — resetting its window too — so nothing
+                        // later back-references this block or any before it. A
+                        // peer that sets BFINAL some other way breaks that, but
+                        // this matches other deployed implementations.
                         self.decompressor.reset(false);
                         total_read = 0;
                     }
@@ -375,15 +324,9 @@ impl DeflateDecompress {
     }
 }
 
-impl From<DeflateContext> for super::PerMessageCompressionContext {
-    fn from(value: DeflateContext) -> Self {
-        Self::Deflate(value)
-    }
-}
-
 #[cfg(test)]
 pub(crate) mod test {
-    use rand::{distr::Distribution as _, RngCore, SeedableRng as _};
+    use rand::{distr::Distribution as _, Rng as _, SeedableRng as _};
 
     use super::*;
 
