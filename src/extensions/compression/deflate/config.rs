@@ -173,6 +173,11 @@ pub struct DeflateConfig {
 #[error("this implementation supports max window bits in {SUPPORTED_WINDOW_BITS:?}")]
 pub struct DeflateInvalidMaxWindowBits;
 
+/// Error type returned by [`DeflateConfig::set_compression_level`].
+#[derive(Copy, Clone, Debug, Error)]
+#[error("compression level must be in 0..=9")]
+pub struct DeflateInvalidCompressionLevel;
+
 impl DeflateConfig {
     /// Constructs a new [`DeflateConfig`] with default parameters.
     pub fn new() -> Self {
@@ -236,6 +241,35 @@ impl DeflateConfig {
         };
         *which = no_context_takeover;
         self
+    }
+
+    /// Sets how hard to try to compress outgoing data, 0 (none) to 9 (best).
+    ///
+    /// The [`compression`] field is public, but its type comes from `flate2`,
+    /// which this crate does not re-export — so a caller outside the crate
+    /// cannot name it. This takes the level as an integer instead, the same
+    /// shape as the two knobs beside it, and adds no dependency to the caller.
+    ///
+    /// Rejects anything above 9 rather than clamping, because nothing below
+    /// this validates: `flate2::Compression::new` accepts any `u32`, and the
+    /// zlib-rs backend only `debug_assert!`s the range, so an out-of-range
+    /// level is silent in a release build.
+    ///
+    /// This setting is local. It never appears in a negotiation offer or
+    /// response, so unlike the window and takeover knobs it carries no protocol
+    /// risk and needs no agreement from the peer.
+    ///
+    /// [`compression`]: DeflateConfig::compression
+    #[inline]
+    pub fn set_compression_level(
+        mut self,
+        level: u32,
+    ) -> Result<Self, DeflateInvalidCompressionLevel> {
+        if level > 9 {
+            return Err(DeflateInvalidCompressionLevel);
+        }
+        self.compression = Compression::new(level);
+        Ok(self)
     }
 
     /// Produces a [`PermessageDeflateConfig`] to send as a client offer to a server.
@@ -675,6 +709,39 @@ mod test {
     use http::HeaderValue;
 
     use super::*;
+
+    #[test]
+    fn set_compression_level_maps_onto_flate2_and_rejects_out_of_range() {
+        // The point of the setter is that a caller outside this crate cannot name
+        // `flate2::Compression`, so the mapping is what has to be right.
+        for level in 0..=9u32 {
+            assert_eq!(
+                DeflateConfig::default()
+                    .set_compression_level(level)
+                    .expect("0..=9 is in range")
+                    .compression,
+                Compression::new(level),
+                "level {level} must map to the same flate2 level"
+            );
+        }
+        // Rejected, not clamped: nothing below this validates, so silently
+        // accepting 10 as 9 would hide a caller's mistake instead of naming it.
+        assert!(DeflateConfig::default().set_compression_level(10).is_err());
+        assert!(DeflateConfig::default().set_compression_level(u32::MAX).is_err());
+    }
+
+    #[test]
+    fn set_compression_level_leaves_the_negotiated_parameters_alone() {
+        // It is a local setting: it must not leak into an offer, because nothing
+        // in RFC 7692 carries a compression level.
+        let base = DeflateConfig::default();
+        let tuned = base.set_compression_level(9).expect("9 is in range");
+        assert_eq!(tuned.as_offer(), base.as_offer(), "the offer must not change");
+        assert_eq!(tuned.server_max_window_bits(), base.server_max_window_bits());
+        assert_eq!(tuned.client_max_window_bits(), base.client_max_window_bits());
+        assert_eq!(tuned.server_no_context_takeover, base.server_no_context_takeover);
+        assert_eq!(tuned.client_no_context_takeover, base.client_no_context_takeover);
+    }
 
     #[test]
     fn accept_response_allows_server_window_bits_below_supported() {
