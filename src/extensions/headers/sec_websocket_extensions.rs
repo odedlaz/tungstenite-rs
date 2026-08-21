@@ -114,17 +114,24 @@ impl WebsocketProtocolExtension {
 impl WebsocketExtensionParam {
     /// Constructs a new parameter with the given name and optional value.
     ///
-    /// **Both** must be an RFC 7230 `token`, and neither is checked here — see
+    /// **Both** must be a `token`, and neither is checked here — see
     /// [`SecWebsocketExtensions::header_value`].
     ///
-    /// The value too, because RFC 6455 §9.1's ABNF says the `quoted-string` form
-    /// must unescape *to* a token. A token contains no character that would need
-    /// quoting, so the quoted form is only ever a redundant encoding, and a value
-    /// that genuinely needs it is not legal in this header. Such a value is still
-    /// quoted on the way out rather than rejected, which keeps this constructor
-    /// infallible — but the result is a header §9.1 obliges a conforming peer to
-    /// fail the connection over. Nothing in this crate produces one: every
-    /// parameter it writes is a name from a fixed set or a small integer.
+    /// The rule for the value, in the RFC's own terms: RFC 6455 §9.1 allows
+    /// `token | quoted-string` and then requires that "the value after
+    /// quoted-string unescaping MUST conform to the 'token' ABNF" — RFC 2616's
+    /// `token`, which excludes every separator. The same set as the RFC 7230
+    /// `tchar` this crate tests against; both admit exactly the printable ASCII
+    /// outside `"(),/:;<=>?@[\]{}`.
+    ///
+    /// The consequence is easy to miss: since a token contains nothing that would
+    /// need quoting, the `quoted-string` form is only ever a redundant encoding,
+    /// and a value that genuinely needs it is not legal here at all. Such a value
+    /// is quoted on the way out rather than rejected, which keeps this
+    /// constructor infallible — but the result is a header §9.1 obliges a
+    /// conforming peer to fail the connection over. Nothing in this crate
+    /// produces one: every parameter it writes is a name from a fixed set or a
+    /// small integer.
     #[inline]
     pub fn new(name: impl Into<Cow<'static, str>>, value: Option<String>) -> Self {
         Self { name: name.into(), value }
