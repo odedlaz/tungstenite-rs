@@ -923,7 +923,6 @@ mod test {
     }
 
     #[test]
-    #[test]
     fn deflate_rejects_a_valueless_server_max_window_bits() {
         // RFC 7692 §7.1.2.1 requires a value here, unlike
         // `client_max_window_bits` in §7.1.2.2, which may stand alone. The two
@@ -977,6 +976,7 @@ mod test {
         assert!(config.server_no_context_takeover && config.client_no_context_takeover);
     }
 
+    #[test]
     fn deflate_rejects_unknown_parameters() {
         assert_eq!(
             PermessageDeflateConfig::parse_params([&WebsocketExtensionParam::new("unknown", None)]),
