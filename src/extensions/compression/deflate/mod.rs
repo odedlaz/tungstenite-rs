@@ -294,12 +294,12 @@ impl DeflateDecompress {
                     Status::Ok => continue,
                     Status::BufError => {
                         // We've either run out of input data or output space.
-                        // The reserve above is capped at the budget, so the
-                        // tightest it gets is one spare byte, at
-                        // `len == size_limit`. One byte is enough for
-                        // `decompress_vec` to make progress, which would push
-                        // `len` past the limit and error above rather than
-                        // arrive here. So this still means we're out of input.
+                        // While input is pending the cap still leaves at
+                        // least one spare byte, which is enough for
+                        // `decompress_vec` to make progress and push `len`
+                        // past the limit, erroring above rather than arriving
+                        // here. The empty-input iteration reserves nothing,
+                        // and that is the out-of-input case this arm is for.
                         break;
                     }
                     Status::StreamEnd => {
