@@ -195,7 +195,7 @@ impl<Stream> WebSocket<Stream> {
     /// # Panics
     /// Panics if config is invalid e.g. `max_write_buffer_size <= write_buffer_size`.
     #[cfg(feature = "handshake")]
-    pub(crate) fn from_raw_socket_with_extensions(
+    pub fn from_raw_socket_with_extensions(
         stream: Stream,
         role: Role,
         config: Option<WebSocketConfig>,

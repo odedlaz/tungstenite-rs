@@ -43,13 +43,27 @@ url = { version = "2.1.0", optional = true }
 
 [dependencies.flate2]
 optional = true
-version = "1.0.27"
+version = "1.0.31"
 default-features = false
-# We need some zlib-compatible backend from flate2 to support setting the
-# context window size. Enabling the "zlib" feature is enough, and, per the
-# flate2 documentation, if other crates in the build graph enable the "zlib-ng"
-# or "zlib-ng-compat" features, those will take precedence.
-features = ["zlib"]
+# Setting the context window size needs a zlib-compatible backend:
+# `Compress::new_with_window_bits` is `#[cfg(feature = "any_zlib")]`, which
+# flate2's pure-Rust default backend does not satisfy. `zlib-rs` sets
+# `any_zlib` without `any_c_zlib`, so it provides the window control with no C
+# toolchain and no `libz-sys` — which matters because flate2's backend choice
+# is global to the binary, not per-dependant. A C backend enabled elsewhere in
+# the graph still takes precedence and is equally correct.
+#
+# The floor is 1.0.31, not 1.0.29. 1.0.29 is where the `zlib-rs` feature first
+# appears, but 1.0.29 and 1.0.30 require `libz-rs-sys ^0.1.1` -- which on a 0.x
+# crate means `>=0.1.1, <0.2.0` -- and that line's inflate stalls with
+# `BufError` when the output buffer refills. So on those two versions the
+# feature has no working configuration at all: there is nothing to pin, because
+# the caret admits only the broken line. 1.0.31 requires `^0.2.1`; both ends of
+# that range are tested, 0.2.1 at this floor and 0.6.7 at the resolved 1.1.9.
+#
+# The failure has no compile-time signal -- it builds, then corrupts every
+# compressed message it receives -- so do not lower this floor.
+features = ["zlib-rs"]
 
 [dependencies.native-tls-crate]
 optional = true

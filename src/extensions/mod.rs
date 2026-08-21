@@ -112,7 +112,7 @@ impl ExtensionsConfig {
                     })?;
 
                     per_message_compression =
-                        Some(DeflateContext::new(Role::Client, deflate_config));
+                        Some(Box::new(DeflateContext::new(Role::Client, deflate_config)));
                 }
                 name => return Err(ExtensionsError::InvalidExtension(name.into())),
             }
@@ -170,8 +170,10 @@ impl ExtensionsConfig {
                     }
 
                     if let Some((config, response)) = deflate.accept_offer(extension) {
-                        per_message_compression =
-                            Some((DeflateContext::new(Role::Server, config), response.into()));
+                        per_message_compression = Some((
+                            Box::new(DeflateContext::new(Role::Server, config)),
+                            response.into(),
+                        ));
                     }
                 }
                 // Ignore any unknown extensions in the offer.
@@ -212,7 +214,7 @@ impl ExtensionsConfig {
         #[cfg(feature = "deflate")]
         {
             per_message_compression = permessage_deflate
-                .map(|deflate| compression::deflate::DeflateContext::new(role, deflate));
+                .map(|deflate| Box::new(compression::deflate::DeflateContext::new(role, deflate)));
         }
         let _ = role;
 
