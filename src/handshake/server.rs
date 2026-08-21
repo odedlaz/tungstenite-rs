@@ -6,6 +6,8 @@ use std::{
     result::Result as StdResult,
 };
 
+#[cfg(feature = "deflate")]
+use headers::HeaderMapExt;
 use http::{
     header::HeaderValue, response::Builder, HeaderMap, Request as HttpRequest,
     Response as HttpResponse, StatusCode,
@@ -19,8 +21,11 @@ use super::{
     machine::{HandshakeMachine, StageResult, TryParse},
     HandshakeRole, MidHandshake, ProcessingResult,
 };
+#[cfg(feature = "deflate")]
+use crate::extensions::headers::SecWebsocketExtensions;
 use crate::{
     error::{Error, ProtocolError, Result},
+    extensions::Extensions,
     handshake::version_as_str,
     protocol::{Role, WebSocket, WebSocketConfig},
 };
@@ -220,6 +225,8 @@ pub struct ServerHandshake<S, C> {
     config: Option<WebSocketConfig>,
     /// Error code/flag. If set, an error will be returned after sending response to the client.
     error_response: Option<ErrorResponse>,
+    // Negotiated extension context for server.
+    extensions: Extensions,
     /// Internal stream type.
     _marker: PhantomData<S>,
 }
@@ -237,6 +244,7 @@ impl<S: Read + Write, C: Callback> ServerHandshake<S, C> {
                 callback: Some(callback),
                 config,
                 error_response: None,
+                extensions: Extensions::default(),
                 _marker: PhantomData,
             },
         }
@@ -258,7 +266,37 @@ impl<S: Read + Write, C: Callback> HandshakeRole for ServerHandshake<S, C> {
                     return Err(Error::Protocol(ProtocolError::JunkAfterRequest));
                 }
 
-                let response = create_response(&result)?;
+                #[cfg_attr(not(feature = "deflate"), allow(unused_mut))]
+                let mut response = create_response(&result)?;
+                // With no PMCE compiled in there is nothing to negotiate, so
+                // the header is not parsed at all — upstream ignores it, and
+                // RFC 6455 §9.1 permits that.
+                //
+                // A header the grammar rejects is treated as absent rather than
+                // failing the handshake, which section 9.1 says a recipient
+                // MUST do. Deliberate: `deflate` is opt-in, so failing here
+                // would mean enabling a feature changes which requests the
+                // server accepts, and ignoring it costs an uncompressed
+                // connection rather than a broken one.
+                #[cfg(feature = "deflate")]
+                if let Some(extensions) =
+                    result.headers().typed_try_get::<SecWebsocketExtensions>().ok().flatten()
+                {
+                    // `None` means defaults here as everywhere else in the
+                    // crate — `accept()` passes it — and the default config
+                    // declines every offer, which RFC 6455 §9.1 permits.
+                    let extensions_config =
+                        self.config.map(|config| config.extensions).unwrap_or_default();
+                    let (extensions, agreed) = extensions_config
+                        .accept_offers(&extensions)
+                        .map_err(ProtocolError::from)?;
+
+                    if let Some(agreed) = agreed {
+                        response.headers_mut().typed_insert(agreed)
+                    };
+                    self.extensions = extensions;
+                }
+
                 let callback_result = if let Some(callback) = self.callback.take() {
                     callback.on_request(&result, response)
                 } else {
@@ -301,7 +339,12 @@ impl<S: Read + Write, C: Callback> HandshakeRole for ServerHandshake<S, C> {
                     return Err(Error::Http(http::Response::from_parts(parts, body).into()));
                 } else {
                     debug!("Server handshake done.");
-                    let websocket = WebSocket::from_raw_socket(stream, Role::Server, self.config);
+                    let websocket = WebSocket::from_raw_socket_with_extensions(
+                        stream,
+                        Role::Server,
+                        self.config,
+                        std::mem::take(&mut self.extensions),
+                    );
                     ProcessingResult::Done(websocket)
                 }
             }
@@ -334,6 +377,79 @@ mod tests {
         let req = request_with_key(key);
         let err = create_response(&req).unwrap_err();
         assert!(matches!(err, Error::Protocol(ProtocolError::InvalidSecWebSocketKey)));
+    }
+
+    /// A duplex over a fixed request, so `accept` can be driven without a socket.
+    struct MockStream {
+        read: std::io::Cursor<Vec<u8>>,
+        written: Vec<u8>,
+    }
+
+    impl std::io::Read for MockStream {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            std::io::Read::read(&mut self.read, buf)
+        }
+    }
+
+    impl std::io::Write for MockStream {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.written.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Drives a bare `accept()` against a request carrying `offer`, and asserts
+    /// the handshake completes with nothing echoed back.
+    fn assert_bare_accept_ignores(offer: &str) {
+        let request = format!(
+            "GET /script.ws HTTP/1.1\r\n\
+             Host: foo.com\r\n\
+             Connection: upgrade\r\n\
+             Upgrade: websocket\r\n\
+             Sec-WebSocket-Version: 13\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+             Sec-WebSocket-Extensions: {offer}\r\n\
+             \r\n"
+        );
+        let stream =
+            MockStream { read: std::io::Cursor::new(request.into_bytes()), written: Vec::new() };
+
+        let socket = crate::accept(stream)
+            .unwrap_or_else(|e| panic!("offer {offer:?} must not fail the handshake: {e}"));
+        let response = String::from_utf8_lossy(&socket.get_ref().written).to_ascii_lowercase();
+        assert!(response.contains("101 switching protocols"), "offer {offer:?}: {response}");
+        assert!(
+            !response.contains("sec-websocket-extensions"),
+            "offer {offer:?} must not be echoed: {response}"
+        );
+    }
+
+    #[test]
+    fn bare_accept_ignores_any_extensions_header() {
+        // A bare `accept()` completes for every one of these in both builds.
+        // With no PMCE compiled in the header is not parsed at all; with one
+        // compiled in the default `ExtensionsConfig` has no
+        // `permessage_deflate`, so every offer is declined without an echo; and
+        // a header the grammar rejects outright is treated as absent rather
+        // than failing. No wire form can fail a handshake upstream would
+        // complete — hence the quoted value and the garbage.
+        for offer in [
+            // What every mainstream browser sends.
+            "permessage-deflate; client_max_window_bits",
+            "permessage-deflate; server_max_window_bits=\"10\"",
+            "permessage-deflate; client_max_window_bits=8",
+            "permessage-deflate; unknown_param=whatever",
+            "permessage-deflate, permessage-deflate; server_no_context_takeover",
+            "foo, bar; baz=2",
+            "x-webkit-deflate-frame",
+            ";;;",
+            "=",
+        ] {
+            assert_bare_accept_ignores(offer);
+        }
     }
 
     #[test]

@@ -15,6 +15,7 @@ use self::{
 };
 use crate::{
     error::{CapacityError, Error, ProtocolError, Result},
+    extensions::{compression::DecompressionError, Extensions, ExtensionsConfig},
     protocol::frame::Utf8Bytes,
 };
 use log::*;
@@ -90,6 +91,11 @@ pub struct WebSocketConfig {
     /// some popular libraries that are sending unmasked frames, ignoring the RFC.
     /// By default this option is set to `false`, i.e. according to RFC 6455.
     pub accept_unmasked_frames: bool,
+    /// Configuration for optional extensions to the base websocket protocol.
+    ///
+    /// Some extensions may require optional features to be enabled at build
+    /// time to be supported.
+    pub extensions: ExtensionsConfig,
 }
 
 impl Default for WebSocketConfig {
@@ -101,6 +107,7 @@ impl Default for WebSocketConfig {
             max_message_size: Some(64 << 20),
             max_frame_size: Some(16 << 20),
             accept_unmasked_frames: false,
+            extensions: ExtensionsConfig::default(),
         }
     }
 }
@@ -181,6 +188,26 @@ impl<Stream> WebSocket<Stream> {
 
     /// Convert a raw socket into a WebSocket without performing a handshake.
     ///
+    /// Where [`WebSocket::from_raw_socket`] infers the enabled extensions from
+    /// the [`WebSocketConfig`], this takes the ones the handshake negotiated.
+    ///
+    /// # Panics
+    /// Panics if config is invalid e.g. `max_write_buffer_size <= write_buffer_size`.
+    #[cfg(feature = "handshake")]
+    pub fn from_raw_socket_with_extensions(
+        stream: Stream,
+        role: Role,
+        config: Option<WebSocketConfig>,
+        extensions: Extensions,
+    ) -> Self {
+        WebSocket {
+            socket: stream,
+            context: WebSocketContext::new_with_extensions(role, config, extensions),
+        }
+    }
+
+    /// Convert a raw socket into a WebSocket without performing a handshake.
+    ///
     /// Call this function if you're using Tungstenite as a part of a web framework
     /// or together with an existing one. If you need an initial handshake, use
     /// `connect()` or `accept()` functions of the crate to construct a websocket.
@@ -193,9 +220,21 @@ impl<Stream> WebSocket<Stream> {
         role: Role,
         config: Option<WebSocketConfig>,
     ) -> Self {
+        Self::from_partially_read_with_extensions(stream, part, role, config, Extensions::default())
+    }
+
+    pub(crate) fn from_partially_read_with_extensions(
+        stream: Stream,
+        part: Vec<u8>,
+        role: Role,
+        config: Option<WebSocketConfig>,
+        extensions: Extensions,
+    ) -> Self {
         WebSocket {
             socket: stream,
-            context: WebSocketContext::from_partially_read(part, role, config),
+            context: WebSocketContext::from_partially_read_with_extensions(
+                part, role, config, extensions,
+            ),
         }
     }
 
@@ -375,6 +414,8 @@ pub struct WebSocketContext {
     unflushed_additional: bool,
     /// The configuration for the websocket session.
     config: WebSocketConfig,
+    // Container for extensions.
+    extensions: Extensions,
 }
 
 impl WebSocketContext {
@@ -384,7 +425,29 @@ impl WebSocketContext {
     /// Panics if config is invalid e.g. `max_write_buffer_size <= write_buffer_size`.
     pub fn new(role: Role, config: Option<WebSocketConfig>) -> Self {
         let conf = config.unwrap_or_default();
-        Self::_new(role, FrameCodec::new(conf.read_buffer_size), conf)
+        Self::_new(
+            role,
+            FrameCodec::new(conf.read_buffer_size),
+            conf,
+            conf.extensions.into_unnegotiated_context(role),
+        )
+    }
+
+    /// Create a WebSocket context for a post-handshake stream with the enabled extensions.
+    ///
+    /// Where [`WebSocketContext::new`] infers the enabled extensions from the
+    /// [`WebSocketConfig`], this takes the ones the handshake negotiated.
+    ///
+    /// # Panics
+    /// Panics if config is invalid e.g. `max_write_buffer_size <= write_buffer_size`.
+    #[cfg(feature = "handshake")]
+    pub(crate) fn new_with_extensions(
+        role: Role,
+        config: Option<WebSocketConfig>,
+        extensions: Extensions,
+    ) -> Self {
+        let conf = config.unwrap_or_default();
+        Self::_new(role, FrameCodec::new(conf.read_buffer_size), conf, extensions)
     }
 
     /// Create a WebSocket context that manages a post-handshake stream.
@@ -393,10 +456,41 @@ impl WebSocketContext {
     /// Panics if config is invalid e.g. `max_write_buffer_size <= write_buffer_size`.
     pub fn from_partially_read(part: Vec<u8>, role: Role, config: Option<WebSocketConfig>) -> Self {
         let conf = config.unwrap_or_default();
-        Self::_new(role, FrameCodec::from_partially_read(part, conf.read_buffer_size), conf)
+        let extensions = conf.extensions.into_unnegotiated_context(role);
+        Self::_new(
+            role,
+            FrameCodec::from_partially_read(part, conf.read_buffer_size),
+            conf,
+            extensions,
+        )
     }
 
-    fn _new(role: Role, mut frame: FrameCodec, config: WebSocketConfig) -> Self {
+    /// Create a WebSocket context for a post-handshake stream with the enabled extensions.
+    ///
+    /// Where [`WebSocketContext::from_partially_read`] infers the enabled
+    /// extensions from the [`WebSocketConfig`], this allows the caller to
+    /// explicitly sets the extensions in use for the connection.
+    pub(crate) fn from_partially_read_with_extensions(
+        part: Vec<u8>,
+        role: Role,
+        config: Option<WebSocketConfig>,
+        extensions: Extensions,
+    ) -> Self {
+        let conf = config.unwrap_or_default();
+        Self::_new(
+            role,
+            FrameCodec::from_partially_read(part, conf.read_buffer_size),
+            conf,
+            extensions,
+        )
+    }
+
+    fn _new(
+        role: Role,
+        mut frame: FrameCodec,
+        config: WebSocketConfig,
+        extensions: Extensions,
+    ) -> Self {
         config.assert_valid();
         frame.set_max_out_buffer_len(config.max_write_buffer_size);
         frame.set_out_buffer_write_len(config.write_buffer_size);
@@ -408,6 +502,7 @@ impl WebSocketContext {
             additional_send: None,
             unflushed_additional: false,
             config,
+            extensions,
         }
     }
 
@@ -500,9 +595,18 @@ impl WebSocketContext {
             return Err(Error::Protocol(ProtocolError::SendAfterClosing));
         }
 
+        let mut prepare_data_frame = |data, opdata| -> Result<Frame, ProtocolError> {
+            const IS_FINAL: bool = true;
+            if let Some(compressor) = self.extensions.per_message_compressor() {
+                let compressed = compressor(&data)?;
+                return Ok(Frame::compressed_message(compressed, opdata, IS_FINAL));
+            }
+            Ok(Frame::message(data, OpCode::Data(opdata), IS_FINAL))
+        };
+
         let frame = match message {
-            Message::Text(data) => Frame::message(data, OpCode::Data(OpData::Text), true),
-            Message::Binary(data) => Frame::message(data, OpCode::Data(OpData::Binary), true),
+            Message::Text(data) => prepare_data_frame(data.into(), OpData::Text)?,
+            Message::Binary(data) => prepare_data_frame(data, OpData::Binary)?,
             Message::Ping(data) => Frame::ping(data),
             Message::Pong(data) => {
                 self.set_additional(Frame::pong(data));
@@ -633,17 +737,53 @@ impl WebSocketContext {
         if !self.state.can_read() {
             return Err(Error::Protocol(ProtocolError::ReceivedAfterClosing));
         }
-        // MUST be 0 unless an extension is negotiated that defines meanings
-        // for non-zero values.  If a nonzero value is received and none of
-        // the negotiated extensions defines the meaning of such a nonzero
-        // value, the receiving endpoint MUST _Fail the WebSocket
-        // Connection_.
-        {
+
+        let (is_compressed, decompressor) = {
+            let decompressor = self.extensions.per_message_decompressor();
             let hdr = frame.header();
-            if hdr.rsv1 || hdr.rsv2 || hdr.rsv3 {
+            // Per RFC 6455, the RSV1, RSV2, and RSV3 bits
+            //
+            //   MUST be 0 unless an extension is negotiated that defines
+            //   meanings for non-zero values.  If a nonzero value is
+            //   received and none of the negotiated extensions defines the
+            //   meaning of such a nonzero value, the receiving endpoint
+            //   MUST _Fail the WebSocket Connection_.
+            //
+            // Per RFC 7692:
+            //
+            //   This document allocates the RSV1 bit of the WebSocket
+            //   header for PMCEs and calls the bit the "Per-Message
+            //   Compressed" bit.  On a WebSocket connection where a PMCE is
+            //   in use, this bit indicates whether a message is compressed
+            //   or not.
+            if (hdr.rsv1 && decompressor.is_none()) || hdr.rsv2 || hdr.rsv3 {
                 return Err(Error::Protocol(ProtocolError::NonZeroReservedBits));
             }
-        }
+
+            let decompressor_with_size_limit = decompressor.map(|mut f| {
+                let incomplete_len =
+                    self.incomplete.as_ref().map(IncompleteMessage::len).unwrap_or(0);
+                let message_max = self.config.max_message_size.unwrap_or(usize::MAX);
+
+                move |bytes, is_final| {
+                    let decompress_limit = message_max.saturating_sub(incomplete_len);
+
+                    f(bytes, is_final, decompress_limit).map_err(|e| match e {
+                        DecompressionError::SizeLimitReached => {
+                            Error::Capacity(CapacityError::MessageTooLong {
+                                size: incomplete_len.saturating_add(decompress_limit),
+                                max_size: message_max,
+                            })
+                        }
+                        DecompressionError::Decompression(e) => {
+                            Error::Protocol(ProtocolError::CompressionFailure(e))
+                        }
+                    })
+                }
+            });
+
+            (hdr.rsv1, decompressor_with_size_limit)
+        };
 
         if self.role == Role::Client && frame.is_masked() {
             // A client MUST close a connection if it detects a masked frame. (RFC 6455)
@@ -652,6 +792,7 @@ impl WebSocketContext {
 
         match frame.header().opcode {
             OpCode::Control(ctl) => {
+                drop(decompressor);
                 match ctl {
                     // All control frames MUST have a payload length of 125 bytes or less
                     // and MUST NOT be fragmented. (RFC 6455)
@@ -660,6 +801,15 @@ impl WebSocketContext {
                     }
                     _ if frame.payload().len() > 125 => {
                         Err(Error::Protocol(ProtocolError::ControlFrameTooBig))
+                    }
+                    // Per RFC 7692:
+                    //
+                    //   An endpoint MUST NOT set the "Per-Message
+                    //   Compressed" bit of control frames and non-first
+                    //   fragments of a data message.  An endpoint receiving
+                    //   such a frame MUST _Fail the WebSocket Connection_.
+                    _ if is_compressed => {
+                        Err(Error::Protocol(ProtocolError::CompressedControlFrame))
                     }
                     OpCtl::Close => Ok(self.do_close(frame.into_close()?).map(Message::Close)),
                     OpCtl::Reserved(i) => {
@@ -679,16 +829,61 @@ impl WebSocketContext {
 
             OpCode::Data(data) => {
                 let fin = frame.header().is_final;
+                let payload = frame.into_payload();
+
+                let decompressor = match data {
+                    OpData::Continue => {
+                        // Per RFC 7692:
+                        //
+                        //   An endpoint MUST NOT set the "Per-Message
+                        //   Compressed" bit of control frames and non-first
+                        //   fragments of a data message.  An endpoint receiving
+                        //   such a frame MUST _Fail the WebSocket Connection_.
+                        if is_compressed {
+                            return Err(Error::Protocol(ProtocolError::CompressedContinueFrame));
+                        }
+
+                        let incomplete_compressed =
+                            self.incomplete.as_ref().is_some_and(IncompleteMessage::compressed);
+                        match (incomplete_compressed, &decompressor) {
+                            (false, _) => None,
+                            (true, Some(_)) => decompressor,
+                            (true, None) => {
+                                // This is a continuation frame that was
+                                // received with compression disabled, but the
+                                // initial frame of the message was received
+                                // with compression *enabled* and RSV1 set.
+                                //
+                                // The only way to get here is to manually
+                                // disable compression for a stream after it's
+                                // been established, which is arguably operator
+                                // error.  This is incorrect enough that it's
+                                // not worth spending a lot of code on, but it's
+                                // better to return an error here than crash.
+                                log::debug!("compression was disabled between receiving frames");
+                                return Err(Error::Protocol(
+                                    ProtocolError::CompressedContinueFrame,
+                                ));
+                            }
+                        }
+                    }
+                    OpData::Text | OpData::Binary => decompressor.filter(|_| is_compressed),
+                    OpData::Reserved(_) => None,
+                };
+                let payload = decompressor
+                    .map(|mut decompressor| decompressor(&payload, fin))
+                    .transpose()?
+                    .unwrap_or(payload);
 
                 let payload = match (data, self.incomplete.as_mut()) {
                     (OpData::Continue, None) => Err(ProtocolError::UnexpectedContinueFrame),
                     (OpData::Continue, Some(incomplete)) => {
-                        incomplete.extend(frame.into_payload(), self.config.max_message_size)?;
+                        incomplete.extend(payload, self.config.max_message_size)?;
                         Ok(None)
                     }
                     (_, Some(_)) => Err(ProtocolError::ExpectedFragment(data)),
-                    (OpData::Text, _) => Ok(Some((frame.into_payload(), MessageType::Text))),
-                    (OpData::Binary, _) => Ok(Some((frame.into_payload(), MessageType::Binary))),
+                    (OpData::Text, _) => Ok(Some((payload, MessageType::Text))),
+                    (OpData::Binary, _) => Ok(Some((payload, MessageType::Binary))),
                     (OpData::Reserved(i), _) => Err(ProtocolError::UnknownDataFrameType(i)),
                 }?;
 
@@ -703,7 +898,11 @@ impl WebSocketContext {
                         }
                     }
                     (Some((payload, t)), false) => {
-                        let mut incomplete = IncompleteMessage::new(t);
+                        let mut incomplete = match is_compressed {
+                            #[cfg(feature = "deflate")]
+                            true => IncompleteMessage::new_compressed(t),
+                            _ => IncompleteMessage::new(t),
+                        };
                         incomplete.extend(payload, self.config.max_message_size)?;
                         self.incomplete = Some(incomplete);
                         Ok(None)
@@ -850,7 +1049,10 @@ impl<T> CheckConnectionReset for Result<T> {
 #[cfg(test)]
 mod tests {
     use super::{Message, Role, WebSocket, WebSocketConfig};
-    use crate::error::{CapacityError, Error};
+    use crate::{
+        error::{CapacityError, Error},
+        extensions::ExtensionsConfig,
+    };
 
     use std::{io, io::Cursor};
 
@@ -910,5 +1112,225 @@ mod tests {
             socket.read(),
             Err(Error::Capacity(CapacityError::MessageTooLong { size: 3, max_size: 2 }))
         ));
+    }
+
+    #[cfg(feature = "deflate")]
+    #[test]
+    fn per_message_deflate_compression() {
+        // Example frames from RFC 7692 Section 7.2.3.2
+
+        use crate::{extensions::compression, protocol::FrameCodec};
+
+        let mut stream = Cursor::new(Vec::new());
+
+        let config = WebSocketConfig {
+            extensions: ExtensionsConfig {
+                permessage_deflate: Some(compression::deflate::DeflateConfig::default()),
+            },
+            ..Default::default()
+        };
+        let mut socket = WebSocket::from_raw_socket(&mut stream, Role::Client, Some(config));
+
+        // The same message sent twice should compress better the second time
+        // because context takeover is enabled.
+        socket.write(Message::Text("Hello".into())).unwrap();
+        socket.write(Message::Text("Hello".into())).unwrap();
+        socket.flush().unwrap();
+
+        let written = stream.into_inner();
+        let mut codec = FrameCodec::new(written.len());
+
+        let mut stream = Cursor::new(written);
+        let first_frame = codec.read_frame(&mut stream, None, true, false).unwrap().unwrap();
+        let second_frame = codec.read_frame(&mut stream, None, true, false).unwrap().unwrap();
+
+        assert_eq!(
+            first_frame.payload(),
+            // First frame payload, from the RFC
+            &[0xf2, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00]
+        );
+
+        assert_eq!(
+            second_frame.payload(),
+            // Second frame payload, from the RFC
+            &[0xf2, 0x00, 0x11, 0x00, 0x00]
+        );
+    }
+
+    #[cfg(feature = "deflate")]
+    #[test]
+    fn per_message_deflate_decompression() {
+        // Example frames from RFC 7692 Section 7.2.3.2
+
+        use crate::extensions::compression::deflate::DeflateConfig;
+
+        let incoming =
+            Cursor::new(&[0x41, 0x03, 0xf2, 0x48, 0xcd, 0x80, 0x04, 0xc9, 0xc9, 0x07, 0x00]);
+        let config = WebSocketConfig {
+            extensions: ExtensionsConfig { permessage_deflate: Some(DeflateConfig::default()) },
+            ..Default::default()
+        };
+        let mut socket = WebSocket::from_raw_socket(WriteMoc(incoming), Role::Client, Some(config));
+
+        assert_eq!(socket.read().unwrap(), Message::Text("Hello".into()));
+    }
+
+    #[test]
+    fn per_message_compression_not_recognized() {
+        // Without the extension configuration, frames with the RSV1 bit set are rejected.
+
+        let incoming =
+            Cursor::new(&[0x41, 0x03, 0xf2, 0x48, 0xcd, 0x80, 0x04, 0xc9, 0xc9, 0x07, 0x00]);
+        let config =
+            WebSocketConfig { extensions: ExtensionsConfig::default(), ..Default::default() };
+        let mut socket = WebSocket::from_raw_socket(WriteMoc(incoming), Role::Client, Some(config));
+
+        assert!(matches!(
+            socket.read().unwrap_err(),
+            Error::Protocol(crate::error::ProtocolError::NonZeroReservedBits)
+        ));
+    }
+
+    #[cfg(feature = "deflate")]
+    #[test]
+    fn per_message_compression_rejects_compressed_control_frame() {
+        // Per RFC 7692 §6.1 the compressed bit is illegal on a control frame
+        // even while the extension is negotiated.
+        use crate::extensions::compression::deflate::DeflateConfig;
+
+        // FIN + RSV1 + Ping, empty payload.
+        let incoming = Cursor::new(&[0xc9, 0x00]);
+        let config = WebSocketConfig {
+            extensions: ExtensionsConfig { permessage_deflate: Some(DeflateConfig::default()) },
+            ..Default::default()
+        };
+        let mut socket = WebSocket::from_raw_socket(WriteMoc(incoming), Role::Client, Some(config));
+
+        assert!(matches!(
+            socket.read().unwrap_err(),
+            Error::Protocol(crate::error::ProtocolError::CompressedControlFrame)
+        ));
+    }
+
+    #[cfg(feature = "deflate")]
+    #[test]
+    fn per_message_compression_rejects_compressed_continue_frame() {
+        // The two-frame message from RFC 7692 §7.2.3.2, but with RSV1 also set
+        // on the continuation. §6.1 allows the bit only on the first fragment.
+        use crate::extensions::compression::deflate::DeflateConfig;
+
+        let incoming = Cursor::new(&[
+            // first fragment: RSV1, Text, not final — legal
+            0x41, 0x03, 0xf2, 0x48, 0xcd,
+            // continuation, which the RFC sends as 0x80; RSV1 set here
+            0xc0, 0x04, 0xc9, 0xc9, 0x07, 0x00,
+        ]);
+        let config = WebSocketConfig {
+            extensions: ExtensionsConfig { permessage_deflate: Some(DeflateConfig::default()) },
+            ..Default::default()
+        };
+        let mut socket = WebSocket::from_raw_socket(WriteMoc(incoming), Role::Client, Some(config));
+
+        assert!(matches!(
+            socket.read().unwrap_err(),
+            Error::Protocol(crate::error::ProtocolError::CompressedContinueFrame)
+        ));
+    }
+
+    #[cfg(feature = "deflate")]
+    #[test]
+    fn per_message_compression_decompress_respects_message_size_limit() {
+        use crate::{
+            extensions::compression::deflate::{test::very_compressed, DeflateConfig},
+            protocol::frame::{
+                coding::{Data, OpCode},
+                FrameHeader,
+            },
+        };
+
+        let _ = env_logger::try_init();
+
+        let base_config = WebSocketConfig {
+            extensions: ExtensionsConfig {
+                permessage_deflate: Some(DeflateConfig::default()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        fn make_message(frame_count: usize) -> Vec<u8> {
+            let mut is_first = true;
+            let mut output = Vec::new();
+
+            for (frame, is_final) in very_compressed::make_frames(frame_count) {
+                let is_first = std::mem::replace(&mut is_first, false);
+                let header = FrameHeader {
+                    opcode: OpCode::Data(if is_first { Data::Binary } else { Data::Continue }),
+                    rsv1: is_first,
+                    is_final,
+                    ..Default::default()
+                };
+                header.format(frame.len() as u64, &mut output).unwrap();
+                output.extend_from_slice(&frame);
+            }
+            output
+        }
+
+        // With the default configuration, a short message of these frames is fine.
+        {
+            let input = Cursor::new(make_message(4));
+            let mut socket = WebSocket::from_raw_socket(input, Role::Client, Some(base_config));
+
+            let message = socket.read().unwrap();
+            assert_eq!(
+                message,
+                Message::Binary(
+                    bytes::BytesMut::zeroed(4 * very_compressed::DECOMPRESSED_LEN).into()
+                )
+            );
+        }
+
+        // The maximum frame size limits on-the-wire frame size, not
+        // decompressed size, so this still decompresses.
+        {
+            let input = Cursor::new(make_message(2));
+            const MAX_FRAME_SIZE: usize = very_compressed::DECOMPRESSED_LEN - 1;
+
+            let mut socket = WebSocket::from_raw_socket(
+                input,
+                Role::Client,
+                Some(base_config.max_frame_size(Some(MAX_FRAME_SIZE))),
+            );
+
+            let message = socket.read().unwrap();
+            assert_eq!(
+                message,
+                Message::Binary(
+                    bytes::BytesMut::zeroed(2 * very_compressed::DECOMPRESSED_LEN).into()
+                )
+            );
+        }
+
+        // With a reduced maximum message size, decompressing the whole message
+        // fails.
+        {
+            let input = Cursor::new(make_message(5));
+            const MAX_MESSAGE_SIZE: usize = 3 * very_compressed::DECOMPRESSED_LEN;
+
+            let mut socket = WebSocket::from_raw_socket(
+                input,
+                Role::Client,
+                Some(base_config.max_message_size(Some(MAX_MESSAGE_SIZE))),
+            );
+
+            let error = socket.read().unwrap_err();
+            assert!(matches!(
+                error,
+                Error::Capacity(CapacityError::MessageTooLong {
+                    size: _,
+                    max_size: MAX_MESSAGE_SIZE
+                })
+            ));
+        }
     }
 }
