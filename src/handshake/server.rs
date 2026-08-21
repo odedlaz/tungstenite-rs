@@ -7,7 +7,7 @@ use std::{
 };
 
 #[cfg(feature = "deflate")]
-use headers::{Header, HeaderMapExt};
+use headers::HeaderMapExt;
 use http::{
     header::HeaderValue, response::Builder, HeaderMap, Request as HttpRequest,
     Response as HttpResponse, StatusCode,
@@ -271,11 +271,16 @@ impl<S: Read + Write, C: Callback> HandshakeRole for ServerHandshake<S, C> {
                 // With no PMCE compiled in there is nothing to negotiate, so
                 // the header is not parsed at all — upstream ignores it, and
                 // RFC 6455 §9.1 permits that.
+                //
+                // A header the grammar rejects is treated as absent rather than
+                // failing the handshake, which section 9.1 says a recipient
+                // MUST do. Deliberate: `deflate` is opt-in, so failing here
+                // would mean enabling a feature changes which requests the
+                // server accepts, and ignoring it costs an uncompressed
+                // connection rather than a broken one.
                 #[cfg(feature = "deflate")]
                 if let Some(extensions) =
-                    result.headers().typed_try_get::<SecWebsocketExtensions>().map_err(|_| {
-                        ProtocolError::InvalidHeader(SecWebsocketExtensions::name().clone().into())
-                    })?
+                    result.headers().typed_try_get::<SecWebsocketExtensions>().ok().flatten()
                 {
                     // `None` means defaults here as everywhere else in the
                     // crate — `accept()` passes it — and the default config
@@ -424,11 +429,12 @@ mod tests {
 
     #[test]
     fn bare_accept_ignores_any_extensions_header() {
-        // A bare `accept()` completes for every one of these in both builds,
-        // for two different reasons: with no PMCE compiled in the header is not
-        // parsed at all, and with one compiled in the default `ExtensionsConfig`
-        // has no `permessage_deflate`, so every offer is declined without an
-        // echo. Either way no wire form can fail a handshake upstream would
+        // A bare `accept()` completes for every one of these in both builds.
+        // With no PMCE compiled in the header is not parsed at all; with one
+        // compiled in the default `ExtensionsConfig` has no
+        // `permessage_deflate`, so every offer is declined without an echo; and
+        // a header the grammar rejects outright is treated as absent rather
+        // than failing. No wire form can fail a handshake upstream would
         // complete — hence the quoted value and the garbage.
         for offer in [
             // What every mainstream browser sends.

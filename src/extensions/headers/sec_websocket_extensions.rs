@@ -202,9 +202,19 @@ impl FromStr for WebsocketProtocolExtension {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let (name, tail) = s.split_once(';').map(|(n, t)| (n, Some(t))).unwrap_or((s, None));
 
+        // `extension-token = registered-token = token` (RFC 6455 section 9.1),
+        // and a `token` is one or more characters, so an empty name is
+        // ungrammatical rather than merely unrecognised. It is the only shape
+        // rejected here — the rest of the grammar is read permissively, and an
+        // extension whose name we do not recognise simply goes unmatched.
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(MalformedExtensionsHeader);
+        }
+
         let params = from_delimited(&mut tail.into_iter(), ';')?;
 
-        Ok(Self { name: name.trim().to_owned().into(), params })
+        Ok(Self { name: name.to_owned().into(), params })
     }
 }
 
@@ -558,6 +568,32 @@ mod tests {
             case.write_with(&mut |slice| value.extend_from_slice(slice));
 
             assert_eq!(value.len(), expected_len, "for {case:?}");
+        }
+    }
+
+    #[test]
+    fn an_empty_extension_name_is_rejected() {
+        // The one shape the grammar refuses. `;a` names nothing before the
+        // first `;`, and the whole header is rejected rather than the element
+        // skipped, because RFC 6455 section 9.1 defines conformance over the
+        // value as a whole.
+        for malformed in [";;;", "; =; =", ";permessage-deflate", "a, ;b"] {
+            let value = HeaderValue::from_str(malformed).expect("a legal header value");
+            assert!(
+                SecWebsocketExtensions::from_header_values([&value]).is_err(),
+                "{malformed:?} names an extension with an empty name"
+            );
+        }
+
+        // Controls: permissive everywhere else, so these must still parse. The
+        // last two are not tokens and are read as names anyway — accepting more
+        // than the ABNF permits is the deliberate part.
+        for accepted in ["permessage-deflate", "permessage-deflate; ; ;", "=", "\""] {
+            let value = HeaderValue::from_str(accepted).expect("a legal header value");
+            assert!(
+                SecWebsocketExtensions::from_header_values([&value]).is_ok(),
+                "{accepted:?} must still parse"
+            );
         }
     }
 }
