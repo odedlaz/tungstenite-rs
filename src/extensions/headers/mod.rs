@@ -2,9 +2,10 @@
 use headers::Error;
 use http::HeaderValue;
 
-mod sec_websocket_extensions;
+/// The `Sec-WebSocket-Extensions` header grammar.
+pub mod sec_websocket_extensions;
 #[allow(unused)]
-pub(crate) use sec_websocket_extensions::{
+pub use sec_websocket_extensions::{
     SecWebsocketExtensions, WebsocketExtensionParam, WebsocketProtocolExtension,
 };
 

@@ -11,10 +11,18 @@ use super::{from_comma_delimited, from_delimited};
 /// server and then from the server to the client. It is a proposed and
 /// agreed-upon list of websocket protocol extensions to use.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+/// The `Sec-WebSocket-Extensions` header, as a list of extension offers or a
+/// negotiated response.
+///
+/// Parses and renders the grammar in RFC 6455 section 9.1: a comma-separated
+/// list of extensions, each with semicolon-separated parameters whose values are
+/// a `token` or a `quoted-string`.
 pub struct SecWebsocketExtensions(Vec<WebsocketProtocolExtension>);
 
 /// An extension listed in a [`SecWebsocketExtensions`] header.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+/// One extension within a [`SecWebsocketExtensions`] header: a name and its
+/// parameters.
 pub struct WebsocketProtocolExtension {
     name: Cow<'static, str>,
     params: Vec<WebsocketExtensionParam>,
@@ -22,6 +30,11 @@ pub struct WebsocketProtocolExtension {
 
 /// Named parameter for an extension in a `Sec-Websocket-Extensions` header.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+/// One parameter of a [`WebsocketProtocolExtension`], such as
+/// `server_max_window_bits=10`.
+///
+/// A parameter may carry no value, which is how RFC 7692 spells the
+/// `*_no_context_takeover` flags.
 pub struct WebsocketExtensionParam {
     name: Cow<'static, str>,
     value: Option<String>,
@@ -40,6 +53,7 @@ impl SecWebsocketExtensions {
 
     /// Returns the number of extensions in this header.
     #[inline]
+    /// The number of extensions in the header.
     pub fn len(&self) -> usize {
         self.0.len()
     }
@@ -78,18 +92,21 @@ impl WebsocketProtocolExtension {
 impl WebsocketExtensionParam {
     /// Constructs a new parameter with the given name and optional value.
     #[inline]
+    /// Constructs a parameter, with a value or without one.
     pub fn new(name: impl Into<Cow<'static, str>>, value: Option<String>) -> Self {
         Self { name: name.into(), value }
     }
 
     /// The name of the parameter.
     #[inline]
+    /// The parameter name.
     pub fn name(&self) -> &str {
         &self.name
     }
 
     /// The parameter value, if there is one.
     #[inline]
+    /// The parameter value, or `None` for a valueless parameter.
     pub fn value(&self) -> Option<&str> {
         self.value.as_deref()
     }

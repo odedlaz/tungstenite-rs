@@ -42,10 +42,12 @@ const CLIENT_MAX_WINDOW_BITS: &str = "client_max_window_bits";
 const ALLOWED_WINDOW_BITS: std::ops::RangeInclusive<NonZeroU8> =
     unsafe { NonZeroU8::new_unchecked(8)..=NonZeroU8::new_unchecked(15) };
 
-/// The supported range of window bit sizes.
+/// The window sizes this implementation can compress with, as base-2 logarithms.
 ///
-/// This subset of [`ALLOWED_WINDOW_BITS`] is the range of sizes that this
-/// implementation can support.
+/// RFC 7692 allows 8 through 15; this range starts at 9 because the `flate2`
+/// backends cannot deflate with an 8-bit window. A peer may still *offer* 8 —
+/// see [`DeflateConfig::set_max_window_bits`], which rejects what it cannot
+/// honour rather than silently widening it.
 pub const SUPPORTED_WINDOW_BITS: std::ops::RangeInclusive<NonZeroU8> =
     unsafe { NonZeroU8::new_unchecked(9) }..=*ALLOWED_WINDOW_BITS.end();
 
@@ -275,7 +277,9 @@ impl DeflateConfig {
     /// Produces a [`PermessageDeflateConfig`] to send as a client offer to a server.
     ///
     /// The returned value can be serialized as a [`WebsocketProtocolExtension`]
-    /// for inclusion in a [`headers::SecWebsocketExtensions`] header.
+    /// for inclusion in a
+    /// [`SecWebsocketExtensions`](crate::extensions::headers::SecWebsocketExtensions)
+    /// header.
     pub fn as_offer(&self) -> PermessageDeflateConfig {
         let Self {
             server_no_context_takeover,

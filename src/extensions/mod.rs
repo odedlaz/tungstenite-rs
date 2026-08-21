@@ -13,7 +13,7 @@ use crate::protocol::Role;
 
 pub mod compression;
 #[cfg(feature = "headers")]
-pub(crate) mod headers;
+pub mod headers;
 
 /// Container for configured extensions for a connection.
 #[derive(Debug, Default)]
