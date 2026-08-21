@@ -130,13 +130,17 @@ enum ClientMaxWindowBits {
 ///
 /// This holds configuration values for a client or server for the
 /// `permessage-deflate` extension defined in [RFC 7692 Section 7]. This can be
-/// used to produce a negotiation offer or response to one as a
-/// [`PermessageDeflateConfig`] that is transmitted to the peer as a
-/// [`WebsocketExtensionParam`].
+/// used to produce a negotiation offer, or a response to one, as a
+/// [`PermessageDeflateConfig`] for transmission to the peer.
 ///
-/// Clients and servers can use the fields and methods on this type to reduce
-/// the maximum usage per connection by reducing the size or lifetime of the
-/// context windows used during compression or decompression.
+/// [`set_max_window_bits`] is the only setting here that reduces per-connection
+/// memory: it shrinks the sliding window, and a peer with a wider window can
+/// always read a narrower stream, so a server may impose it without the client
+/// agreeing. The `no_context_takeover` flags do **not** free anything — they
+/// reset the compressor between messages and it keeps its buffers — so they
+/// trade compression ratio and CPU, not memory.
+///
+/// [`set_max_window_bits`]: DeflateConfig::set_max_window_bits
 ///
 /// [RFC 7692 Section 7]: https://tools.ietf.org/html/rfc7692#section-7
 #[derive(Clone, Copy, Debug, PartialEq)]
