@@ -67,6 +67,12 @@ impl SecWebsocketExtensions {
         self.0.len()
     }
 
+    /// Returns whether this header carries no extensions.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
     /// Returns a [`HeaderValue`] with the encoded contents of this header.
     ///
     /// # Panics

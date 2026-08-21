@@ -189,7 +189,7 @@ pub fn generate_request(
     if let Some(header) = extensions
         .map(ExtensionsConfig::generate_offers)
         .map(SecWebsocketExtensions::new)
-        .filter(|header| header.len() != 0)
+        .filter(|header| !header.is_empty())
     {
         headers.append(SecWebsocketExtensions::name(), header.header_value());
     }

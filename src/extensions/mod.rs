@@ -278,7 +278,7 @@ mod test {
             ]))
             .unwrap();
 
-        assert!(matches!(per_message_compression, None));
+        assert!(per_message_compression.is_none());
         assert_eq!(response, None);
     }
 
@@ -290,7 +290,7 @@ mod test {
         let (Extensions { per_message_compression }, response) =
             extensions.accept_offers(&SecWebsocketExtensions::new([])).unwrap();
 
-        assert!(matches!(per_message_compression, None));
+        assert!(per_message_compression.is_none());
         assert_eq!(response, None);
     }
 
@@ -304,7 +304,7 @@ mod test {
             // shouldn't include it.
             let (Extensions { per_message_compression }, response) =
                 extensions.accept_offers(&SecWebsocketExtensions::new([])).unwrap();
-            assert!(matches!(per_message_compression, None));
+            assert!(per_message_compression.is_none());
             assert_eq!(response, None);
         }
 
@@ -317,7 +317,7 @@ mod test {
                 ]))
                 .unwrap();
 
-            assert!(matches!(per_message_compression, Some(_)));
+            assert!(per_message_compression.is_some());
             assert_eq!(
                 response,
                 Some(SecWebsocketExtensions::new([WebsocketProtocolExtension::new(

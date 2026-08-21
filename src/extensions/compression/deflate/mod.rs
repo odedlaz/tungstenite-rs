@@ -317,7 +317,7 @@ impl DeflateDecompress {
             // flushes out any pending bytes that were part of the previous
             // block and doesn't leave any others since the trailer is explicitly
             // an empty block.
-            decompress_from(&ELIDED_TRAILER_BLOCK_CONTENTS)?;
+            decompress_from(ELIDED_TRAILER_BLOCK_CONTENTS)?;
 
             if !self.peer_context_takeover {
                 self.decompressor.reset(false);
