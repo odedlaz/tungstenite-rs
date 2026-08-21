@@ -209,13 +209,41 @@ fn unquote(value: &str) -> String {
     unescaped
 }
 
+/// Re-applies the `quoted-string` form when a value cannot be written bare.
+///
+/// RFC 6455 section 9.1 allows an extension parameter value to be a `token` or a
+/// `quoted-string`. [`unquote`] accepts either, so without the mirror here a
+/// value that arrived quoted is re-emitted bare — and one containing `;` or `,`
+/// then reads as a parameter or extension boundary to the next parser, which is
+/// structure loss rather than a formatting difference.
+fn quote_if_needed(value: &str) -> std::borrow::Cow<'_, str> {
+    // RFC 7230 `tchar`. Anything outside it, including an empty value, needs the
+    // quoted form.
+    let is_token = !value.is_empty()
+        && value.bytes().all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b));
+    if is_token {
+        return std::borrow::Cow::Borrowed(value);
+    }
+
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('"');
+    for c in value.chars() {
+        if c == '"' || c == '\\' {
+            quoted.push('\\');
+        }
+        quoted.push(c);
+    }
+    quoted.push('"');
+    std::borrow::Cow::Owned(quoted)
+}
+
 impl std::fmt::Display for WebsocketExtensionParam {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let Self { name, value } = self;
 
         write!(f, "{name}")?;
         if let Some(value) = value {
-            write!(f, "={value}")?;
+            write!(f, "={}", quote_if_needed(value))?;
         }
         Ok(())
     }
@@ -258,7 +286,10 @@ impl WriteTo for WebsocketExtensionParam {
 
         if let Some(value) = value {
             write(b"=");
-            write(value.as_bytes());
+            // This is the path `header_value` uses, so the quoting has to happen
+            // here and not only in `Display`. `encoded_len` is derived from this
+            // same walk, so the length follows the quoting automatically.
+            write(quote_if_needed(value).as_bytes());
         }
     }
 }
@@ -301,6 +332,38 @@ impl<T: WriteTo, const N: usize> WriteTo for CommaDelimited<[T; N]> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_param_value_needing_quotes_round_trips_through_the_header() {
+        // Must go through the whole header, not a lone param: `FromStr` for a
+        // single param splits only on the first `=`, so `x=a;b` round-trips at
+        // that level either way. The loss happens where `;` and `,` are
+        // structural -- which is the header. Testing the param alone passes with
+        // the re-quote removed, which is how this test was wrong first.
+        for value in [r#"a;b"#, "a,b", "a b", "with\"quote", "back\\slash", ""] {
+            let original = SecWebsocketExtensions::new([WebsocketProtocolExtension::new(
+                "permessage-deflate",
+                [WebsocketExtensionParam::new("x", Some(value.to_owned()))],
+            )]);
+
+            let rendered = original.header_value();
+            let reparsed = SecWebsocketExtensions::decode(&mut [rendered.clone()].iter())
+                .unwrap_or_else(|e| panic!("our own header must parse: {rendered:?}: {e}"));
+
+            assert_eq!(
+                reparsed, original,
+                "value {value:?} rendered as {rendered:?} and did not survive the header"
+            );
+        }
+    }
+
+    #[test]
+    fn a_token_value_is_still_written_bare() {
+        // The common case must not gain quotes: every consumer parses these as
+        // integers and a quoted form would be a gratuitous wire change.
+        let param = WebsocketExtensionParam::new("server_max_window_bits", Some("10".to_owned()));
+        assert_eq!(param.to_string(), "server_max_window_bits=10");
+    }
+
     use headers::{Header, HeaderMapExt as _};
 
     use super::*;
