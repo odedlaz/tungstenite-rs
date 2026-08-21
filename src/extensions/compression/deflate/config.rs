@@ -923,6 +923,60 @@ mod test {
     }
 
     #[test]
+    #[test]
+    fn deflate_rejects_a_valueless_server_max_window_bits() {
+        // RFC 7692 §7.1.2.1 requires a value here, unlike
+        // `client_max_window_bits` in §7.1.2.2, which may stand alone. The two
+        // are asserted together because the asymmetry is the whole point: the
+        // same shape is a rejection for one role and valid for the other.
+        assert_eq!(
+            PermessageDeflateConfig::parse_params([&WebsocketExtensionParam::new(
+                "server_max_window_bits",
+                None
+            )]),
+            // The absent value is reported as empty rather than as its own
+            // variant; that is `InvalidParameterValue`'s existing shape.
+            Err(ParameterError::InvalidParameterValue {
+                name: "server_max_window_bits",
+                value: String::new(),
+            })
+        );
+        assert_eq!(
+            PermessageDeflateConfig::parse_params([&WebsocketExtensionParam::new(
+                "client_max_window_bits",
+                None
+            )])
+            .map(|config| config.client_max_window_bits),
+            Ok(ClientMaxWindowBits::NoValue)
+        );
+    }
+
+    #[test]
+    fn deflate_rejects_a_takeover_flag_carrying_a_value() {
+        // RFC 7692 §7.1.1 gives these no value. Accepting one would mean
+        // reading `server_no_context_takeover=0` as *enabling* the flag, which
+        // is the opposite of what such a peer meant.
+        for role in ["server", "client"] {
+            let name = format!("{role}_no_context_takeover");
+            assert_eq!(
+                PermessageDeflateConfig::parse_params([&WebsocketExtensionParam::new(
+                    name.clone(),
+                    Some("0".to_string())
+                )])
+                .map_err(|e| e.to_string()),
+                Err(format!("Invalid value 0 for parameter {name}")),
+                "{name} must not accept a value"
+            );
+        }
+        // Control: the same parameters without values are accepted.
+        let config = PermessageDeflateConfig::parse_params([
+            &WebsocketExtensionParam::new("server_no_context_takeover", None),
+            &WebsocketExtensionParam::new("client_no_context_takeover", None),
+        ])
+        .expect("the valueless form is how these are meant to arrive");
+        assert!(config.server_no_context_takeover && config.client_no_context_takeover);
+    }
+
     fn deflate_rejects_unknown_parameters() {
         assert_eq!(
             PermessageDeflateConfig::parse_params([&WebsocketExtensionParam::new("unknown", None)]),
