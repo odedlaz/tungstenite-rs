@@ -43,7 +43,7 @@ url = { version = "2.1.0", optional = true }
 
 [dependencies.flate2]
 optional = true
-version = "1.0.29"
+version = "1.0.31"
 default-features = false
 # Setting the context window size needs a zlib-compatible backend:
 # `Compress::new_with_window_bits` is `#[cfg(feature = "any_zlib")]`, which
@@ -51,8 +51,12 @@ default-features = false
 # `any_zlib` without `any_c_zlib`, so it provides the window control with no C
 # toolchain and no `libz-sys` — which matters because flate2's backend choice
 # is global to the binary, not per-dependant. A C backend enabled elsewhere in
-# the graph still takes precedence and is equally correct. 1.0.29 is the first
-# release offering `zlib-rs`.
+# the graph still takes precedence and is equally correct.
+#
+# The floor is 1.0.31, not 1.0.29. 1.0.29 is where the `zlib-rs` feature first
+# appears, but 1.0.29 and 1.0.30 pull zlib-rs 0.1.1, whose inflate stalls with
+# `BufError` when the output buffer refills -- so the feature builds and then
+# fails to decompress. 1.0.31 pulls zlib-rs 0.2.1 and passes.
 features = ["zlib-rs"]
 
 [dependencies.native-tls-crate]
