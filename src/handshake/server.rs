@@ -423,24 +423,16 @@ mod tests {
     }
 
     #[test]
-    fn bare_accept_ignores_offered_extensions() {
-        // Every mainstream browser offers `permessage-deflate`, and `accept()`
-        // passes `config: None`. Everywhere else in the crate that means "use
-        // defaults", and RFC 6455 §9.1 lets a server ignore an offer it does
-        // not support, so this handshake must succeed with nothing negotiated.
-        assert_bare_accept_ignores("permessage-deflate; client_max_window_bits");
-    }
-
-    #[test]
     fn bare_accept_ignores_any_extensions_header() {
         // A bare `accept()` completes for every one of these in both builds,
         // for two different reasons: with no PMCE compiled in the header is not
         // parsed at all, and with one compiled in the default `ExtensionsConfig`
         // has no `permessage_deflate`, so every offer is declined without an
         // echo. Either way no wire form can fail a handshake upstream would
-        // complete — hence the quoted value and the garbage. The plain browser
-        // offer has its own test above.
+        // complete — hence the quoted value and the garbage.
         for offer in [
+            // What every mainstream browser sends.
+            "permessage-deflate; client_max_window_bits",
             "permessage-deflate; server_max_window_bits=\"10\"",
             "permessage-deflate; client_max_window_bits=8",
             "permessage-deflate; unknown_param=whatever",

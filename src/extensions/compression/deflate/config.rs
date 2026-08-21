@@ -42,10 +42,12 @@ const CLIENT_MAX_WINDOW_BITS: &str = "client_max_window_bits";
 const ALLOWED_WINDOW_BITS: std::ops::RangeInclusive<NonZeroU8> =
     unsafe { NonZeroU8::new_unchecked(8)..=NonZeroU8::new_unchecked(15) };
 
-/// The supported range of window bit sizes.
+/// The window sizes this implementation can compress with, as base-2 logarithms.
 ///
-/// This subset of [`ALLOWED_WINDOW_BITS`] is the range of sizes that this
-/// implementation can support.
+/// RFC 7692 allows 8 through 15; this range starts at 9 because the `flate2`
+/// backends cannot deflate with an 8-bit window. A peer may still *offer* 8 —
+/// see [`DeflateConfig::set_max_window_bits`], which rejects what it cannot
+/// honour rather than silently widening it.
 pub const SUPPORTED_WINDOW_BITS: std::ops::RangeInclusive<NonZeroU8> =
     unsafe { NonZeroU8::new_unchecked(9) }..=*ALLOWED_WINDOW_BITS.end();
 
@@ -71,7 +73,7 @@ pub enum NegotiationError {
 /// directive.
 #[derive(Debug, Error)]
 #[cfg_attr(test, derive(PartialEq))]
-pub(crate) enum ParameterError {
+pub enum ParameterError {
     /// Unknown parameter in a negotiation response.
     #[error("Unknown parameter in a negotiation response: {0}")]
     UnknownParameter(String),
@@ -80,7 +82,12 @@ pub(crate) enum ParameterError {
     DuplicateParameter(String),
     /// Parameter has an unexpected or invalid value.
     #[error("Invalid value {value} for parameter {name}")]
-    InvalidParameterValue { name: &'static str, value: String },
+    InvalidParameterValue {
+        /// The parameter whose value was rejected.
+        name: &'static str,
+        /// The value as it arrived, unparsed.
+        value: String,
+    },
 }
 
 /// Contents of a `permessage-deflate` Per-Message Compression Extension.
@@ -255,9 +262,7 @@ impl DeflateConfig {
     /// zlib-rs backend only `debug_assert!`s the range, so an out-of-range
     /// level is silent in a release build.
     ///
-    /// This setting is local. It never appears in a negotiation offer or
-    /// response, so unlike the window and takeover knobs it carries no protocol
-    /// risk and needs no agreement from the peer.
+    /// Local only — it never appears in a negotiation offer or response.
     ///
     /// [`compression`]: DeflateConfig::compression
     #[inline]
@@ -275,7 +280,9 @@ impl DeflateConfig {
     /// Produces a [`PermessageDeflateConfig`] to send as a client offer to a server.
     ///
     /// The returned value can be serialized as a [`WebsocketProtocolExtension`]
-    /// for inclusion in a [`headers::SecWebsocketExtensions`] header.
+    /// for inclusion in a
+    /// [`SecWebsocketExtensions`](crate::extensions::headers::SecWebsocketExtensions)
+    /// header.
     pub fn as_offer(&self) -> PermessageDeflateConfig {
         let Self {
             server_no_context_takeover,
@@ -325,7 +332,13 @@ impl DeflateConfig {
     ///   server supports them.
     ///
     /// [RFC 7692 Section 5]: https://tools.ietf.org/html/rfc7692#section-5
-    pub(crate) fn accept_offer(
+    /// Decides a server's response to a client's `permessage-deflate` offer.
+    ///
+    /// Returns the configuration to run and the parameters to echo, or `None` to
+    /// decline. The server's own configuration acts as a floor: a flag set here
+    /// is imposed whether or not the client asked for it, and a window this
+    /// build cannot compress with is declined rather than silently widened.
+    pub fn accept_offer(
         &self,
         client: PermessageDeflateConfig,
     ) -> Option<(DeflateConfig, PermessageDeflateConfig)> {
@@ -387,17 +400,11 @@ impl DeflateConfig {
                 // The client supports the parameter so we can use our configured value.
                 client_max_window_bits
             }
-            // No lower bound: this caps the *client's* compressor and the
-            // server only inflates with it, which is correct at any window at
-            // least as large — `DeflateContext::new` raises the inflate window
-            // to the smallest flate2 accepts, so 8 costs nothing to accept.
+            // No lower bound — the peer's compressor, which we only inflate with.
             ClientMaxWindowBits::Bits(client_max) => client_max.min(client_max_window_bits),
         };
 
-        // Mirror of the pair in `accept_response`, with the roles swapped:
-        // `server_max_window_bits` is our own compressor here and has to be one
-        // we can deflate with, `client_max_window_bits` is the peer's and any
-        // legal value is fine.
+        // Server side of the invariant on the fields; `accept_response` asserts the other.
         debug_assert!(SUPPORTED_WINDOW_BITS.contains(&server_max_window_bits));
         debug_assert!(ALLOWED_WINDOW_BITS.contains(&client_max_window_bits));
 
@@ -430,7 +437,12 @@ impl DeflateConfig {
     /// configuration, with the response from the server as the argument. An
     /// `Ok` result will indicate the set of options the client should use for
     /// the remainder of the connection.
-    pub(crate) fn accept_response(
+    /// Checks a server's response against the offer a client sent.
+    ///
+    /// Returns the configuration to run, or an error if the response is not one
+    /// this client can honour — a parameter it never offered, or a window
+    /// outside what this build supports.
+    pub fn accept_response(
         self,
         server: PermessageDeflateConfig,
     ) -> Result<Self, NegotiationError> {
@@ -471,11 +483,8 @@ impl DeflateConfig {
                 return Err(NegotiationError::InvalidServerMaxWindowBitsValue(received.get()));
             }
 
-            // No lower bound: this value is the *server's* compressor window
-            // and we only inflate with it, which is correct at any window at
-            // least as large — `DeflateContext::new` raises it to the smallest
-            // flate2 accepts. Recording it unclamped keeps this equal to what
-            // was negotiated, which is what RFC 7692 §7.1.2.1 defines.
+            // No lower bound — the peer's compressor. Recorded unclamped so this
+            // equals what was negotiated, which is what RFC 7692 §7.1.2.1 defines.
             received
         };
 
@@ -509,9 +518,7 @@ impl DeflateConfig {
             }
         };
 
-        // `server_max_window_bits` is the peer's compressor here, so any legal
-        // value is fine; `client_max_window_bits` is ours and has to be one we
-        // can actually compress with.
+        // Client side of the same invariant.
         debug_assert!(ALLOWED_WINDOW_BITS.contains(&server_max_window_bits));
         debug_assert!(SUPPORTED_WINDOW_BITS.contains(&client_max_window_bits));
 
@@ -565,7 +572,13 @@ impl PermessageDeflateConfig {
     }
 
     /// Parses the extension parameter list for a `Sec-WebSocket-Extensions` header.
-    pub(crate) fn parse_params<'p>(
+    /// Parses an extension's parameter list into a validated configuration.
+    ///
+    /// The caller that owns the HTTP handshake needs this: it has the parameters
+    /// from a `Sec-WebSocket-Extensions` offer and has to turn them into
+    /// something it can decide on. Fields on the result are valid per RFC 7692
+    /// section 7.
+    pub fn parse_params<'p>(
         params: impl IntoIterator<Item = &'p WebsocketExtensionParam>,
     ) -> Result<Self, ParameterError> {
         let mut this = Self {
@@ -744,30 +757,14 @@ mod test {
     }
 
     #[test]
-    fn accept_response_allows_server_window_bits_below_supported() {
-        // `server_max_window_bits` constrains the *server's* compressor, so the
-        // client only inflates with it. 8 is legal per RFC 7692 §7.1.2.1 and a
-        // conforming server may send it even unprompted, so a client that fails
-        // the handshake over it kills a valid connection.
-        let client = DeflateConfig::new();
-        let response = PermessageDeflateConfig {
-            server_max_window_bits: Some(8.try_into().unwrap()),
-            ..Default::default()
-        };
-
-        let agreed = client.accept_response(response).expect("8 is a legal server window");
-        assert_eq!(agreed.server_max_window_bits().get(), 8);
-    }
-
-    #[test]
     fn agreed_eight_bit_peer_window_inflates() {
-        // The point of accepting 8: our own context must not panic in
-        // `Decompress::new_with_window_bits`, and must still inflate the peer's
-        // stream. The peer here compresses at 9 because that is what a C zlib
-        // server actually emits for a requested 8 — `deflateInit2` promotes it —
-        // and because flate2 panics below 9 on the compressor side too, so no
-        // flate2 peer can produce a true 8-bit stream. Negotiation keeps our own
-        // compressor at or above 9 for exactly that reason.
+        // `server_max_window_bits` is the server's compressor, so a client only
+        // inflates with it: 8 is legal (RFC 7692 §7.1.2.1) and a conforming
+        // server may send it unprompted, so refusing kills a valid connection.
+        // Accepting is safe only because `DeflateContext::new` clamps — both
+        // `Decompress::new_with_window_bits` and its compress twin assert
+        // 9..=15, which is also why the peer below compresses at 9 and why
+        // negotiation keeps our own compressor there.
         let client = DeflateConfig::new();
         let agreed = client
             .accept_response(PermessageDeflateConfig {
@@ -777,8 +774,6 @@ mod test {
             .expect("8 is a legal server window");
         assert_eq!(agreed.server_max_window_bits().get(), 8);
 
-        // Must not panic: `Decompress::new_with_window_bits` rejects 8, so the
-        // clamp in `DeflateContext::new` is what makes this constructible.
         let mut us =
             crate::extensions::compression::deflate::DeflateContext::new(Role::Client, agreed);
 
@@ -894,6 +889,60 @@ mod test {
                 ..Default::default()
             })
         );
+    }
+
+    #[test]
+    fn deflate_rejects_a_valueless_server_max_window_bits() {
+        // RFC 7692 §7.1.2.1 requires a value here, unlike
+        // `client_max_window_bits` in §7.1.2.2, which may stand alone. The two
+        // are asserted together because the asymmetry is the whole point: the
+        // same shape is a rejection for one role and valid for the other.
+        assert_eq!(
+            PermessageDeflateConfig::parse_params([&WebsocketExtensionParam::new(
+                "server_max_window_bits",
+                None
+            )]),
+            // The absent value is reported as empty rather than as its own
+            // variant; that is `InvalidParameterValue`'s existing shape.
+            Err(ParameterError::InvalidParameterValue {
+                name: "server_max_window_bits",
+                value: String::new(),
+            })
+        );
+        assert_eq!(
+            PermessageDeflateConfig::parse_params([&WebsocketExtensionParam::new(
+                "client_max_window_bits",
+                None
+            )])
+            .map(|config| config.client_max_window_bits),
+            Ok(ClientMaxWindowBits::NoValue)
+        );
+    }
+
+    #[test]
+    fn deflate_rejects_a_takeover_flag_carrying_a_value() {
+        // RFC 7692 §7.1.1 gives these no value. Accepting one would mean
+        // reading `server_no_context_takeover=0` as *enabling* the flag, which
+        // is the opposite of what such a peer meant.
+        for role in ["server", "client"] {
+            let name = format!("{role}_no_context_takeover");
+            assert_eq!(
+                PermessageDeflateConfig::parse_params([&WebsocketExtensionParam::new(
+                    name.clone(),
+                    Some("0".to_string())
+                )])
+                .map_err(|e| e.to_string()),
+                Err(format!("Invalid value 0 for parameter {name}")),
+                "{name} must not accept a value"
+            );
+        }
+        // Control: the same parameters without values are accepted.
+        let config = PermessageDeflateConfig::parse_params([
+            &WebsocketExtensionParam::new("server_no_context_takeover", None),
+            &WebsocketExtensionParam::new("client_no_context_takeover", None),
+        ])
+        .expect("the valueless form is how these are meant to arrive");
+        assert!(config.server_no_context_takeover && config.client_no_context_takeover);
     }
 
     #[test]
