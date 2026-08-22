@@ -451,6 +451,62 @@ mod tests {
 
     #[cfg(feature = "deflate")]
     #[test]
+    fn absent_and_empty_extension_headers_agree_and_a_malformed_one_does_not() {
+        // Records the three response shapes: absent, present but naming nothing,
+        // and unparseable. Only the third is a protocol error.
+        //
+        // The first two are *observationally identical* here -- every arm of the
+        // match below maps an empty agreed set to `Extensions::default()` -- so
+        // this test has no power to tell them apart, and does not claim to. A
+        // mutation replacing the `Option` with an unconditional `Some(parsed)`
+        // passes it and the whole lib suite. What it does pin is the malformed
+        // case. The absent-versus-empty distinction only becomes observable once
+        // a response omitting a parameter local policy required must hard-fail
+        // (RFC 7692 section 7); the discriminating test belongs with that
+        // validator, not here.
+        use super::VerifyData;
+        use crate::extensions::{compression::deflate::DeflateConfig, ExtensionsConfig};
+
+        let key = "dGhlIHNhbXBsZSBub25jZQ==";
+        let accept = crate::handshake::derive_accept_key(key.as_bytes());
+        let offered =
+            ExtensionsConfig { permessage_deflate: Some(DeflateConfig::default()) };
+
+        let negotiated = |extensions_header: Option<&str>| {
+            let mut builder = http::Response::builder()
+                .status(101)
+                .header("Connection", "Upgrade")
+                .header("Upgrade", "websocket")
+                .header("Sec-WebSocket-Accept", accept.clone());
+            if let Some(value) = extensions_header {
+                builder = builder.header("Sec-WebSocket-Extensions", value);
+            }
+            let verify = VerifyData {
+                accept_key: accept.clone(),
+                subprotocols: None,
+                caller_offered_extensions: false,
+            };
+            verify
+                .verify_response(builder.body(None).unwrap(), Some(&offered))
+                .map(|(_, mut extensions)| extensions.per_message_compressor().is_some())
+        };
+
+        assert_eq!(
+            negotiated(None).expect("an absent header is not an error"),
+            false,
+            "absent header must leave compression off"
+        );
+        assert_eq!(
+            negotiated(Some("")).expect("a header naming no extension is not an error"),
+            false,
+            "present-but-empty header must agree with absent"
+        );
+        negotiated(Some("permessage-deflate; client_max_window_bits=not-a-number"))
+            .expect_err("an unparseable header must stay a protocol error");
+    }
+
+    #[cfg(feature = "deflate")]
+    #[test]
     fn response_extension_never_offered_is_rejected() {
         // RFC 6455 §4.1 step 5: an extension the client's handshake did not
         // contain is a MUST-fail. `client()` and `connect()` pass no config and
