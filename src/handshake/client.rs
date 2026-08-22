@@ -388,7 +388,7 @@ mod tests {
 
         let accept = crate::handshake::derive_accept_key(b"dGhlIHNhbXBsZSBub25jZQ==");
         let verify = VerifyData { accept_key: accept.clone(), subprotocols: None };
-        let response = |header: Option<&str>, offered: Option<Settings>| {
+        let response_value = |header: Option<http::HeaderValue>, offered: Option<Settings>| {
             let mut response = http::Response::builder()
                 .status(101)
                 .header("Connection", "Upgrade")
@@ -399,6 +399,9 @@ mod tests {
             }
             let response = verify.verify_response(response.body(None).unwrap())?;
             verify.verify_deflate_response(&response, offered)
+        };
+        let response = |header: Option<&str>, offered: Option<Settings>| {
+            response_value(header.map(|value| value.parse().unwrap()), offered)
         };
         let invalid_for = |header, offered| {
             // The compact API deliberately collapses every invalid PMD response
@@ -416,6 +419,30 @@ mod tests {
         assert!(invalid_for("permessage-deflate", None));
         assert!(invalid_for("permessage-deflate; x=\"unterminated", None));
         assert!(response(Some("x-example; x=\"unterminated"), None).unwrap().is_none());
+        assert!(response_value(
+            Some(http::HeaderValue::from_bytes(b"x-example; x=\x80").unwrap()),
+            None
+        )
+        .unwrap()
+        .is_none());
+        assert!(matches!(
+            response_value(
+                Some(http::HeaderValue::from_bytes(b"permessage-deflate; x=\x80").unwrap()),
+                None
+            ),
+            Err(Error::Protocol(ProtocolError::InvalidHeader(_)))
+        ));
+        assert_eq!(
+            response_value(
+                Some(
+                    http::HeaderValue::from_bytes(b"x-example; x=\x80, PerMessage-Deflate",)
+                        .unwrap(),
+                ),
+                Some(Settings::default())
+            )
+            .unwrap(),
+            Some(Settings::default())
+        );
         assert!(invalid(";x"));
         assert!(invalid("permessage-deflate; client_max_window_bits"));
         assert!(invalid("permessage-deflate; client_max_window_bits=09"));
@@ -500,6 +527,18 @@ mod tests {
         request
             .headers_mut()
             .append("Sec-WebSocket-Extensions", "x-example, permessage-deflate".parse().unwrap());
+        let result = ClientHandshake::start(
+            Cursor::new(Vec::new()),
+            request,
+            Some(WebSocketConfig::default().enable_deflate()),
+        );
+        assert!(matches!(result, Err(Error::Protocol(ProtocolError::InvalidHeader(_)))));
+
+        let mut request = "ws://localhost/path".into_client_request().unwrap();
+        request.headers_mut().append(
+            "Sec-WebSocket-Extensions",
+            http::HeaderValue::from_bytes(b"PerMessage-Deflate; x=\x80").unwrap(),
+        );
         let result = ClientHandshake::start(
             Cursor::new(Vec::new()),
             request,

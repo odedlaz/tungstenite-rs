@@ -27,8 +27,7 @@ pub(super) fn offer(settings: Settings) -> HeaderValue {
 pub(super) fn accept_response(settings: Settings, headers: &HeaderMap) -> Result<Option<Settings>> {
     let mut selected = None;
     for value in headers.get_all(SEC_WEBSOCKET_EXTENSIONS) {
-        let value = value.to_str().map_err(|_| invalid_header())?;
-        for extension in split_quoted(value, b',')? {
+        for extension in split_header(value.as_bytes(), b',')? {
             if let Some(params) = parse(extension)? {
                 if selected.replace(params).is_some() {
                     return Err(invalid_header());
@@ -66,8 +65,8 @@ pub(super) fn accept_offers(
     settings: Settings,
     offers: &[HeaderValue],
 ) -> Option<(Settings, HeaderValue)> {
-    for value in offers.iter().filter_map(|value| value.to_str().ok()) {
-        for extension in split_quoted(value, b',').into_iter().flatten() {
+    for value in offers {
+        for extension in split_header(value.as_bytes(), b',').into_iter().flatten() {
             if let Ok(Some(offer)) = parse(extension) {
                 if let Some(accepted) = accept_offer(settings, offer) {
                     return Some(accepted);
@@ -136,17 +135,20 @@ enum ClientWindow {
     Bits(u8),
 }
 
-fn parse(extension: &str) -> Result<Option<Params>> {
-    let parts = split_quoted(extension, b';')?;
-    let name = parts.first().map_or("", |name| name.trim());
+fn parse(extension: &[u8]) -> Result<Option<Params>> {
+    let name = trim_ascii(extension.split(|byte| *byte == b';').next().unwrap_or_default());
     if name.is_empty() {
-        return if extension.trim().is_empty() { Ok(None) } else { Err(invalid_header()) };
+        return if trim_ascii(extension).is_empty() { Ok(None) } else { Err(invalid_header()) };
     }
-    // HTTP field values use case-insensitive tokens; accept that leniency for
-    // extension and parameter names while keeping parameter values exact.
-    if !name.eq_ignore_ascii_case(NAME) {
+    // Classify the ASCII extension token before decoding its parameters so an
+    // unrelated extension may carry any valid HeaderValue bytes.
+    if !name.eq_ignore_ascii_case(NAME.as_bytes()) {
         return Ok(None);
     }
+    let extension = std::str::from_utf8(extension).map_err(|_| invalid_header())?;
+    let parts = split_quoted(extension, b';')?;
+    // HTTP field values use case-insensitive tokens; accept that leniency for
+    // extension and parameter names while keeping parameter values exact.
     let mut parsed = Params::default();
     for parameter in &parts[1..] {
         let (name, value) = parameter
@@ -244,13 +246,41 @@ fn invalid_header() -> Error {
     ProtocolError::InvalidHeader(SEC_WEBSOCKET_EXTENSIONS.clone().into()).into()
 }
 
+fn split_header(value: &[u8], delimiter: u8) -> Result<Vec<&[u8]>> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut quoted = false;
+    let mut escaped = false;
+    for (index, byte) in value.iter().copied().enumerate() {
+        if quoted {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                quoted = false;
+            }
+        } else if byte == b'"' {
+            quoted = true;
+        } else if byte == delimiter {
+            parts.push(&value[start..index]);
+            start = index + 1;
+        }
+    }
+    if quoted || escaped {
+        return Err(invalid_header());
+    }
+    parts.push(&value[start..]);
+    Ok(parts)
+}
+
 pub(crate) fn headers_select_deflate(headers: &HeaderMap) -> bool {
     for value in headers.get_all(SEC_WEBSOCKET_EXTENSIONS) {
-        let Ok(value) = value.to_str() else { continue };
+        let value = value.as_bytes();
         let mut start = 0;
         let mut quoted = false;
         let mut escaped = false;
-        for (index, byte) in value.bytes().enumerate() {
+        for (index, byte) in value.iter().copied().enumerate() {
             if quoted {
                 if escaped {
                     escaped = false;
@@ -275,6 +305,13 @@ pub(crate) fn headers_select_deflate(headers: &HeaderMap) -> bool {
     false
 }
 
-fn extension_is_deflate(extension: &str) -> bool {
-    extension.split_once(';').map_or(extension, |(name, _)| name).trim().eq_ignore_ascii_case(NAME)
+fn extension_is_deflate(extension: &[u8]) -> bool {
+    let name = extension.split(|byte| *byte == b';').next().unwrap_or_default();
+    trim_ascii(name).eq_ignore_ascii_case(NAME.as_bytes())
+}
+
+fn trim_ascii(value: &[u8]) -> &[u8] {
+    let start = value.iter().position(|byte| !byte.is_ascii_whitespace()).unwrap_or(value.len());
+    let end = value.iter().rposition(|byte| !byte.is_ascii_whitespace()).map_or(start, |i| i + 1);
+    &value[start..end]
 }

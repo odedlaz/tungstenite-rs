@@ -450,5 +450,12 @@ mod tests {
             WebSocketConfig::default().enable_deflate().accept_deflate_offers(&split);
         assert_eq!(response.unwrap(), "permessage-deflate");
         assert!(config.deflate.is_some());
+
+        let mixed_raw =
+            [http::HeaderValue::from_bytes(b"x-example; value=\x80, PerMessage-Deflate").unwrap()];
+        let (config, response) =
+            WebSocketConfig::default().enable_deflate().accept_deflate_offers(&mixed_raw);
+        assert_eq!(response.unwrap(), "permessage-deflate");
+        assert!(config.deflate.is_some());
     }
 }
