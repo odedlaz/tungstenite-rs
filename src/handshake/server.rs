@@ -271,7 +271,7 @@ impl<S: Read + Write, C: Callback> HandshakeRole for ServerHandshake<S, C> {
                         let mut response = response;
                         #[cfg(feature = "deflate")]
                         if self.config.as_ref().is_some_and(|config| config.deflate.is_some()) {
-                            if crate::protocol::deflate::headers_select_deflate(response.headers())?
+                            if crate::protocol::deflate::headers_select_deflate(response.headers())
                             {
                                 return Err(Error::Protocol(ProtocolError::InvalidHeader(
                                     http::header::SEC_WEBSOCKET_EXTENSIONS.clone().into(),

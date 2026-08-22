@@ -61,7 +61,7 @@ impl<S: Read + Write> ClientHandshake<S> {
 
         #[cfg(feature = "deflate")]
         if let Some(offer) = config.as_ref().and_then(|config| config.deflate.map(|d| d.offer())) {
-            if crate::protocol::deflate::headers_select_deflate(request.headers())? {
+            if crate::protocol::deflate::headers_select_deflate(request.headers()) {
                 return Err(Error::Protocol(ProtocolError::InvalidHeader(
                     http::header::SEC_WEBSOCKET_EXTENSIONS.clone().into(),
                 )));
@@ -323,7 +323,7 @@ impl VerifyData {
     ) -> Result<Option<crate::protocol::deflate::Settings>> {
         match offered {
             Some(offered) => offered.accept_response(response.headers()),
-            None if crate::protocol::deflate::headers_select_deflate(response.headers())? => {
+            None if crate::protocol::deflate::headers_select_deflate(response.headers()) => {
                 Err(Error::Protocol(ProtocolError::InvalidHeader(
                     http::header::SEC_WEBSOCKET_EXTENSIONS.clone().into(),
                 )))
@@ -401,6 +401,9 @@ mod tests {
             verify.verify_deflate_response(&response, offered)
         };
         let invalid_for = |header, offered| {
+            // The compact API deliberately collapses every invalid PMD response
+            // to InvalidHeader. These rows pin acceptance and installed state,
+            // not the private parser route that produced the error.
             matches!(
                 response(Some(header), offered),
                 Err(Error::Protocol(ProtocolError::InvalidHeader(_)))
@@ -411,6 +414,8 @@ mod tests {
         assert!(response(None, Some(Settings::default())).unwrap().is_none());
         assert!(response(Some(""), Some(Settings::default())).unwrap().is_none());
         assert!(invalid_for("permessage-deflate", None));
+        assert!(invalid_for("permessage-deflate; x=\"unterminated", None));
+        assert!(response(Some("x-example; x=\"unterminated"), None).unwrap().is_none());
         assert!(invalid(";x"));
         assert!(invalid("permessage-deflate; client_max_window_bits"));
         assert!(invalid("permessage-deflate; client_max_window_bits=09"));
@@ -424,17 +429,18 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(agreed.server_max_window_bits, 8);
+        assert_eq!(agreed, Settings { server_max_window_bits: 8, ..Settings::default() });
         assert!(invalid_for(
             "permessage-deflate",
             Some(Settings::default().no_context_takeover(Role::Server, true))
         ));
-        assert!(response(
+        let agreed = response(
             Some("permessage-deflate"),
-            Some(Settings::default().no_context_takeover(Role::Client, true))
+            Some(Settings::default().no_context_takeover(Role::Client, true)),
         )
         .unwrap()
-        .is_some());
+        .unwrap();
+        assert_eq!(agreed, Settings::default().no_context_takeover(Role::Client, true));
 
         let agreed = response(
             Some("permessage-deflate; client_no_context_takeover"),
@@ -442,7 +448,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert!(agreed.client_no_context_takeover);
+        assert_eq!(agreed, Settings::default().no_context_takeover(Role::Client, true));
 
         let agreed = response(
             Some("x-example; value=\"a,b;c\", permessage-deflate; server_no_context_takeover; client_max_window_bits=\"1\\0\""),
@@ -450,15 +456,20 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert!(agreed.server_no_context_takeover);
-        assert_eq!(agreed.client_max_window_bits, 10);
+        assert_eq!(
+            agreed,
+            Settings::default()
+                .no_context_takeover(Role::Server, true)
+                .max_window_bits(Role::Client, 10)
+        );
 
         let capped = Settings::default().max_window_bits(Role::Server, 12);
         assert!(invalid_for("permessage-deflate", Some(capped)));
         assert!(invalid_for("permessage-deflate; server_max_window_bits=13", Some(capped)));
-        assert!(response(Some("permessage-deflate; server_max_window_bits=12"), Some(capped))
-            .unwrap()
-            .is_some());
+        assert_eq!(
+            response(Some("permessage-deflate; server_max_window_bits=12"), Some(capped)).unwrap(),
+            Some(capped)
+        );
 
         assert_eq!(
             Settings::default().max_window_bits(Role::Client, 12).offer().to_str().unwrap(),
@@ -471,7 +482,10 @@ mod tests {
             "Sec-WebSocket-Extensions",
             "permessage-deflate; client_max_window_bits=\"10\"".parse().unwrap(),
         );
-        assert!(Settings::default().accept_response(&headers).unwrap().is_some());
+        assert_eq!(
+            Settings::default().accept_response(&headers).unwrap(),
+            Some(Settings::default().max_window_bits(Role::Client, 10))
+        );
     }
 
     #[cfg(feature = "deflate")]

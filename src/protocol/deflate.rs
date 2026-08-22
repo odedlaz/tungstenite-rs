@@ -335,6 +335,8 @@ fn parse(extension: &str) -> Result<Option<Params>> {
     if name.is_empty() {
         return if extension.trim().is_empty() { Ok(None) } else { Err(invalid_header()) };
     }
+    // HTTP field values use case-insensitive tokens; accept that leniency for
+    // extension and parameter names while keeping parameter values exact.
     if !name.eq_ignore_ascii_case(NAME) {
         return Ok(None);
     }
@@ -435,17 +437,62 @@ fn invalid_header() -> Error {
     ProtocolError::InvalidHeader(SEC_WEBSOCKET_EXTENSIONS.clone().into()).into()
 }
 
-pub(crate) fn headers_select_deflate(headers: &HeaderMap) -> Result<bool> {
+pub(crate) fn headers_select_deflate(headers: &HeaderMap) -> bool {
     for value in headers.get_all(SEC_WEBSOCKET_EXTENSIONS) {
-        let value = value.to_str().map_err(|_| invalid_header())?;
-        for extension in split_quoted(value, b',')? {
-            let name = split_quoted(extension, b';')?.into_iter().next().unwrap_or("").trim();
-            if name.eq_ignore_ascii_case(NAME) {
-                return Ok(true);
+        let Ok(value) = value.to_str() else { continue };
+        let mut start = 0;
+        let mut quoted = false;
+        let mut escaped = false;
+        for (index, byte) in value.bytes().enumerate() {
+            if quoted {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == b'"' {
+                    quoted = false;
+                }
+            } else if byte == b'"' {
+                quoted = true;
+            } else if byte == b',' {
+                if extension_is_deflate(&value[start..index]) {
+                    return true;
+                }
+                start = index + 1;
             }
         }
+        if extension_is_deflate(&value[start..]) {
+            return true;
+        }
     }
-    Ok(false)
+    false
+}
+
+fn extension_is_deflate(extension: &str) -> bool {
+    extension.split_once(';').map_or(extension, |(name, _)| name).trim().eq_ignore_ascii_case(NAME)
+}
+
+#[cfg(test)]
+mod peer_window {
+    use super::*;
+
+    #[test]
+    fn agreed_eight_bit_peer_window_inflates() {
+        let mut client = Context::new(
+            Role::Client,
+            Settings { server_max_window_bits: 8, ..Settings::default() },
+        );
+        // flate2 only constructs 9..=15-bit streams. A negotiated peer window
+        // of 8 is legal, so the decoder clamps it to 9 rather than panicking.
+        let mut server = Context::new(
+            Role::Server,
+            Settings { server_max_window_bits: 9, ..Settings::default() },
+        );
+        let payload = b"the quick brown fox jumps over the lazy dog, twice over";
+        let compressed = server.compress(payload).expect("peer compresses");
+        let inflated = client.decompress(&compressed, true, 0, None).expect("we inflate");
+        assert_eq!(inflated.as_ref(), payload);
+    }
 }
 
 #[cfg(test)]
