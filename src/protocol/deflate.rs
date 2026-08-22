@@ -449,6 +449,81 @@ pub(crate) fn headers_select_deflate(headers: &HeaderMap) -> Result<bool> {
 }
 
 #[cfg(test)]
+mod bounds {
+    use super::*;
+    use crate::error::{CapacityError, Error};
+
+    fn pair() -> (Context, Context) {
+        (
+            Context::new(Role::Server, Settings::default()),
+            Context::new(Role::Client, Settings::default()),
+        )
+    }
+
+    /// `inflate` detects an over-budget message by allowing exactly one byte past
+    /// the budget and observing that it arrived: `writable` is
+    /// `remaining.saturating_add(1)`. That `+1` is the entire detector, so the
+    /// interesting rows are the two either side of the boundary -- at the limit
+    /// exactly, which must be accepted, and one byte over, which must not.
+    #[test]
+    fn a_message_is_accepted_at_the_limit_and_rejected_one_byte_over() {
+        let payload = vec![b'x'; 4000];
+        let (mut server, mut client) = pair();
+        let wire = server.compress(&payload).expect("compress");
+
+        let at_limit = client.decompress(&wire, true, 0, Some(payload.len()));
+        assert_eq!(
+            at_limit.expect("a message exactly at the limit must be accepted").as_ref(),
+            &payload[..],
+            "and it must decode whole"
+        );
+
+        let (mut server, mut client) = pair();
+        let wire = server.compress(&payload).expect("compress");
+        match client.decompress(&wire, true, 0, Some(payload.len() - 1)) {
+            Err(Error::Capacity(CapacityError::MessageTooLong { size, max_size })) => {
+                assert_eq!(max_size, payload.len() - 1);
+                assert!(size > max_size, "the reported size must exceed the limit");
+            }
+            other => panic!("one byte over the limit must be MessageTooLong, got {other:?}"),
+        }
+    }
+
+    /// `already` is the bytes an earlier frame of the same message contributed, so
+    /// the budget is per message rather than per frame. Without it a fragmented
+    /// message could deliver `max_size` bytes per frame indefinitely.
+    #[test]
+    fn the_budget_counts_bytes_delivered_by_earlier_frames() {
+        let payload = vec![b'y'; 2000];
+        let (mut server, mut client) = pair();
+        let wire = server.compress(&payload).expect("compress");
+
+        // Same message, same limit, but half of it is already accounted for.
+        match client.decompress(&wire, true, 1500, Some(payload.len())) {
+            Err(Error::Capacity(CapacityError::MessageTooLong { .. })) => {}
+            other => panic!("`already` must consume the budget, got {other:?}"),
+        }
+    }
+
+    /// A highly compressible payload against a much smaller budget: the guard has
+    /// to fire while inflating rather than after materialising everything.
+    #[test]
+    fn a_compression_bomb_is_stopped_rather_than_materialised() {
+        let payload = vec![0u8; 512 * 1024];
+        let (mut server, mut client) = pair();
+        let wire = server.compress(&payload).expect("compress");
+        assert!(wire.len() < 4096, "the fixture must actually be a bomb: {} bytes", wire.len());
+
+        match client.decompress(&wire, true, 0, Some(8 * 1024)) {
+            Err(Error::Capacity(CapacityError::MessageTooLong { max_size, .. })) => {
+                assert_eq!(max_size, 8 * 1024);
+            }
+            other => panic!("a bomb against a small budget must be rejected, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
 mod liveness {
     use super::*;
 
