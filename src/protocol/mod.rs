@@ -638,8 +638,8 @@ impl WebSocketContext {
             let plain = Frame::message(data, OpCode::Data(opcode), true);
             #[cfg(feature = "deflate")]
             if let Some(deflate) = &mut this.deflate {
-                // Keep admission role-aware through the helper also used after masking in
-                // `buffer_frame`; the client-mask term is pinned on both sides.
+                // Keep this role-aware: for clients, `wire_size` counts the mask before
+                // `buffer_frame` applies it.
                 if !this.frame.can_buffer(wire_size(this.role, &plain)) {
                     return Err(Error::WriteBufferFull(Message::Frame(plain).into()));
                 }
@@ -1349,6 +1349,117 @@ mod write_transaction {
         }
         socket.flush().expect("flush");
         assert!(socket.get_ref().0.is_empty(), "nothing may reach the wire for a rejected message");
+    }
+
+    /// The client mask is not present on `plain` yet, but its four bytes belong
+    /// to the preflight size. The cap sits inside that exact gap: estimating this
+    /// client frame as a server frame admits it, after which compression makes it
+    /// small enough for the later check and silently changes the documented
+    /// uncompressed-size decision.
+    #[test]
+    fn arm_six_client_preflight_counts_the_mask_before_it_is_added() {
+        let payload = vec![b'z'; 400];
+        let plain = Frame::message(payload.clone(), OpCode::Data(OpData::Binary), true);
+        let server_wire = wire_size(Role::Server, &plain);
+        let client_wire = wire_size(Role::Client, &plain);
+        assert_eq!(client_wire, server_wire + 4, "the fixture must isolate the mask term");
+        let cap = server_wire + 2;
+
+        let config = WebSocketConfig::default()
+            .write_buffer_size(100)
+            .max_write_buffer_size(cap)
+            .enable_deflate();
+        let mut socket =
+            WebSocket::from_raw_socket(Recorder::default(), Role::Client, Some(config));
+
+        match socket.write(Message::binary(payload)) {
+            Err(Error::WriteBufferFull(message)) => match *message {
+                Message::Frame(frame) => {
+                    assert!(!frame.header().rsv1, "the returned frame must be uncompressed")
+                }
+                other => panic!("must carry a frame, got {other:?}"),
+            },
+            other => panic!("the client mask makes the plain frame exceed the cap: {other:?}"),
+        }
+    }
+
+    /// The compressed-size check has its own role-bearing call site. An expanding
+    /// payload makes the plain client frame fit while the compressed client frame
+    /// crosses the cap only because of its mask. Estimating that second frame as
+    /// a server frame returns it as compressed; the later retry admission then
+    /// rejects it instead of the expansion branch sending the safe plain frame.
+    #[test]
+    fn arm_seven_client_compressed_size_counts_the_mask() {
+        use crate::protocol::deflate::{Context, Settings};
+
+        let payload = noise(300, 7);
+        let compressed =
+            Context::new(Role::Client, Settings::default()).compress(&payload).expect("compress");
+        assert!(compressed.len() > payload.len(), "the fixture must expand");
+
+        let plain = Frame::message(payload.clone(), OpCode::Data(OpData::Binary), true);
+        let mut compressed_frame = Frame::message(compressed, OpCode::Data(OpData::Binary), true);
+        compressed_frame.header_mut().rsv1 = true;
+        let plain_wire = wire_size(Role::Client, &plain);
+        let compressed_server_wire = wire_size(Role::Server, &compressed_frame);
+        let compressed_client_wire = wire_size(Role::Client, &compressed_frame);
+        assert_eq!(compressed_client_wire, compressed_server_wire + 4);
+        let cap = compressed_server_wire + 2;
+        assert!(
+            plain_wire <= cap && cap < compressed_client_wire,
+            "the cap must isolate the compressed-frame mask term"
+        );
+
+        let config = WebSocketConfig::default()
+            .write_buffer_size(0)
+            .max_write_buffer_size(cap)
+            .enable_deflate();
+        let mut socket =
+            WebSocket::from_raw_socket(Recorder::default(), Role::Client, Some(config));
+        socket
+            .write(Message::binary(payload.clone()))
+            .expect("expansion must fall back to the plain frame");
+        socket.flush().expect("flush");
+
+        let wire = &socket.get_ref().0;
+        assert_eq!(wire[0] & 0x40, 0, "the expansion branch must clear RSV1");
+        let mut peer = WebSocket::from_raw_socket(
+            io::Cursor::new(wire.clone()),
+            Role::Server,
+            Some(WebSocketConfig::default().enable_deflate()),
+        );
+        assert_eq!(peer.read().expect("peer reads the plain frame"), Message::binary(payload));
+    }
+
+    /// A caller-owned frame bypasses both preparation checks, so retry admission
+    /// is the only place left to count the client mask. Its cap sits inside the
+    /// four-byte gap just as in arm six.
+    #[test]
+    fn arm_eight_client_retry_admission_counts_the_mask() {
+        let frame = Frame::message(vec![b'x'; 125], OpCode::Data(OpData::Binary), true);
+        let server_wire = wire_size(Role::Server, &frame);
+        let client_wire = wire_size(Role::Client, &frame);
+        assert_eq!(client_wire, server_wire + 4, "the fixture must isolate the mask term");
+        let cap = server_wire + 2;
+
+        let config = WebSocketConfig::default()
+            .write_buffer_size(0)
+            .max_write_buffer_size(cap)
+            .enable_deflate();
+        let mut socket =
+            WebSocket::from_raw_socket(Recorder::default(), Role::Client, Some(config));
+
+        match socket.write(Message::Frame(frame)) {
+            Err(Error::WriteBufferFull(message)) => match *message {
+                Message::Frame(frame) => {
+                    assert!(!frame.is_masked(), "the caller-owned frame is returned unchanged")
+                }
+                other => panic!("must carry the caller's frame, got {other:?}"),
+            },
+            other => {
+                panic!("the client mask makes the caller-owned frame exceed the cap: {other:?}")
+            }
+        }
     }
 
     #[test]
