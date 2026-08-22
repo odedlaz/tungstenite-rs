@@ -638,6 +638,8 @@ impl WebSocketContext {
             let plain = Frame::message(data, OpCode::Data(opcode), true);
             #[cfg(feature = "deflate")]
             if let Some(deflate) = &mut this.deflate {
+                // Keep admission role-aware through the helper also used after masking in
+                // `buffer_frame`; the client-mask term is pinned on both sides.
                 if !this.frame.can_buffer(wire_size(this.role, &plain)) {
                     return Err(Error::WriteBufferFull(Message::Frame(plain).into()));
                 }
