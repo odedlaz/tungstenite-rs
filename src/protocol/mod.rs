@@ -172,6 +172,9 @@ impl WebSocketConfig {
     ///
     /// Defaults to the backend's default. Levels above the default cost CPU for
     /// a ratio gain that is small on short messages.
+    ///
+    /// # Panics
+    /// Panics if `level` is above 9.
     #[cfg(feature = "deflate")]
     pub fn deflate_compression_level(mut self, level: u32) -> Self {
         self.deflate = Some(self.deflate.unwrap_or_default().compression_level(level));

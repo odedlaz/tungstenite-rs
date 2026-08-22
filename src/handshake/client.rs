@@ -61,6 +61,11 @@ impl<S: Read + Write> ClientHandshake<S> {
 
         #[cfg(feature = "deflate")]
         if let Some(offer) = config.as_ref().and_then(|config| config.deflate.map(|d| d.offer())) {
+            if crate::protocol::deflate::headers_select_deflate(request.headers())? {
+                return Err(Error::Protocol(ProtocolError::InvalidHeader(
+                    http::header::SEC_WEBSOCKET_EXTENSIONS.clone().into(),
+                )));
+            }
             request.headers_mut().append("Sec-WebSocket-Extensions", offer);
         }
 
@@ -107,9 +112,12 @@ impl<S: Read + Write> HandshakeRole for ClientHandshake<S> {
                 };
 
                 #[cfg(feature = "deflate")]
-                if let Some(config) = self.config.as_mut() {
-                    config.deflate =
-                        self.verify_data.verify_deflate_response(&result, config.deflate)?;
+                {
+                    let offered = self.config.as_ref().and_then(|config| config.deflate);
+                    let agreed = self.verify_data.verify_deflate_response(&result, offered)?;
+                    if let Some(config) = self.config.as_mut() {
+                        config.deflate = agreed;
+                    }
                 }
 
                 debug!("Client handshake done.");
@@ -315,6 +323,11 @@ impl VerifyData {
     ) -> Result<Option<crate::protocol::deflate::Settings>> {
         match offered {
             Some(offered) => offered.accept_response(response.headers()),
+            None if crate::protocol::deflate::headers_select_deflate(response.headers())? => {
+                Err(Error::Protocol(ProtocolError::InvalidHeader(
+                    http::header::SEC_WEBSOCKET_EXTENSIONS.clone().into(),
+                )))
+            }
             None => Ok(None),
         }
     }
@@ -375,7 +388,7 @@ mod tests {
 
         let accept = crate::handshake::derive_accept_key(b"dGhlIHNhbXBsZSBub25jZQ==");
         let verify = VerifyData { accept_key: accept.clone(), subprotocols: None };
-        let response = |header: Option<&str>, offered: Settings| {
+        let response = |header: Option<&str>, offered: Option<Settings>| {
             let mut response = http::Response::builder()
                 .status(101)
                 .header("Connection", "Upgrade")
@@ -385,37 +398,130 @@ mod tests {
                 response = response.header("Sec-WebSocket-Extensions", header);
             }
             let response = verify.verify_response(response.body(None).unwrap())?;
-            verify.verify_deflate_response(&response, Some(offered))
+            verify.verify_deflate_response(&response, offered)
         };
-        let invalid = |header| {
+        let invalid_for = |header, offered| {
             matches!(
-                response(Some(header), Settings::default()),
+                response(Some(header), offered),
                 Err(Error::Protocol(ProtocolError::InvalidHeader(_)))
             )
         };
+        let invalid = |header| invalid_for(header, Some(Settings::default()));
 
-        assert!(response(None, Settings::default()).unwrap().is_none());
-        assert!(response(Some(""), Settings::default()).unwrap().is_none());
+        assert!(response(None, Some(Settings::default())).unwrap().is_none());
+        assert!(response(Some(""), Some(Settings::default())).unwrap().is_none());
+        assert!(invalid_for("permessage-deflate", None));
         assert!(invalid(";x"));
         assert!(invalid("permessage-deflate; client_max_window_bits"));
         assert!(invalid("permessage-deflate; client_max_window_bits=09"));
-        assert!(response(
+        assert!(invalid("permessage-deflate; client_max_window_bits=+9"));
+        assert!(invalid(
+            "permessage-deflate; client_max_window_bits=12; client_max_window_bits=12"
+        ));
+        let agreed = response(
             Some("permessage-deflate; server_max_window_bits=8"),
-            Settings::default()
+            Some(Settings::default()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(agreed.server_max_window_bits, 8);
+        assert!(invalid_for(
+            "permessage-deflate",
+            Some(Settings::default().no_context_takeover(Role::Server, true))
+        ));
+        assert!(response(
+            Some("permessage-deflate"),
+            Some(Settings::default().no_context_takeover(Role::Client, true))
         )
         .unwrap()
         .is_some());
-        assert!(response(
-            Some("permessage-deflate"),
-            Settings::default().no_context_takeover(Role::Server, true)
-        )
-        .is_err());
-        assert!(response(
-            Some("permessage-deflate"),
-            Settings::default().no_context_takeover(Role::Client, true)
+
+        let agreed = response(
+            Some("permessage-deflate; client_no_context_takeover"),
+            Some(Settings::default()),
         )
         .unwrap()
-        .is_some());
+        .unwrap();
+        assert!(agreed.client_no_context_takeover);
+
+        let agreed = response(
+            Some("x-example; value=\"a,b;c\", permessage-deflate; server_no_context_takeover; client_max_window_bits=\"1\\0\""),
+            Some(Settings::default()),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(agreed.server_no_context_takeover);
+        assert_eq!(agreed.client_max_window_bits, 10);
+
+        let capped = Settings::default().max_window_bits(Role::Server, 12);
+        assert!(invalid_for("permessage-deflate", Some(capped)));
+        assert!(invalid_for("permessage-deflate; server_max_window_bits=13", Some(capped)));
+        assert!(response(Some("permessage-deflate; server_max_window_bits=12"), Some(capped))
+            .unwrap()
+            .is_some());
+
+        assert_eq!(
+            Settings::default().max_window_bits(Role::Client, 12).offer().to_str().unwrap(),
+            "permessage-deflate; client_max_window_bits=12"
+        );
+
+        let mut headers = http::HeaderMap::new();
+        headers.append("Sec-WebSocket-Extensions", "x-example".parse().unwrap());
+        headers.append(
+            "Sec-WebSocket-Extensions",
+            "permessage-deflate; client_max_window_bits=\"10\"".parse().unwrap(),
+        );
+        assert!(Settings::default().accept_response(&headers).unwrap().is_some());
+    }
+
+    #[cfg(feature = "deflate")]
+    #[test]
+    fn client_rejects_competing_deflate_offer() {
+        use std::io::Cursor;
+
+        use super::ClientHandshake;
+        use crate::{error::ProtocolError, protocol::WebSocketConfig, Error};
+
+        let mut request = "ws://localhost/path".into_client_request().unwrap();
+        request
+            .headers_mut()
+            .append("Sec-WebSocket-Extensions", "x-example, permessage-deflate".parse().unwrap());
+        let result = ClientHandshake::start(
+            Cursor::new(Vec::new()),
+            request,
+            Some(WebSocketConfig::default().enable_deflate()),
+        );
+        assert!(matches!(result, Err(Error::Protocol(ProtocolError::InvalidHeader(_)))));
+    }
+
+    #[cfg(feature = "deflate")]
+    #[test]
+    fn client_rejects_unoffered_deflate_response() {
+        use std::{io::Cursor, marker::PhantomData};
+
+        use super::{super::machine::StageResult, ClientHandshake, HandshakeRole, VerifyData};
+        use crate::{error::ProtocolError, Error};
+
+        let accept_key = crate::handshake::derive_accept_key(b"dGhlIHNhbXBsZSBub25jZQ==");
+        let response = http::Response::builder()
+            .status(101)
+            .header("Connection", "Upgrade")
+            .header("Upgrade", "websocket")
+            .header("Sec-WebSocket-Accept", accept_key.clone())
+            .header("Sec-WebSocket-Extensions", "permessage-deflate")
+            .body(None)
+            .unwrap();
+        let mut handshake = ClientHandshake {
+            verify_data: VerifyData { accept_key, subprotocols: None },
+            config: None,
+            _marker: PhantomData,
+        };
+        let result = handshake.stage_finished(StageResult::DoneReading {
+            stream: Cursor::new(Vec::new()),
+            result: response,
+            tail: Vec::new(),
+        });
+        assert!(matches!(result, Err(Error::Protocol(ProtocolError::InvalidHeader(_)))));
     }
 
     #[test]

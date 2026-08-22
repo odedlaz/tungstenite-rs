@@ -1,6 +1,7 @@
 use bytes::Bytes;
 use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
 use http::{header::SEC_WEBSOCKET_EXTENSIONS, HeaderMap, HeaderValue};
+use std::borrow::Cow;
 
 use crate::{
     error::{Error, ProtocolError, Result},
@@ -65,7 +66,11 @@ impl Settings {
         if self.server_max_window_bits < 15 {
             value.push_str(&format!("; server_max_window_bits={}", self.server_max_window_bits));
         }
-        value.push_str("; client_max_window_bits");
+        if self.client_max_window_bits < 15 {
+            value.push_str(&format!("; client_max_window_bits={}", self.client_max_window_bits));
+        } else {
+            value.push_str("; client_max_window_bits");
+        }
         HeaderValue::from_str(&value).expect("the generated extension offer is valid")
     }
 
@@ -73,20 +78,26 @@ impl Settings {
         let mut selected = None;
         for value in headers.get_all(SEC_WEBSOCKET_EXTENSIONS) {
             let value = value.to_str().map_err(|_| invalid_header())?;
-            for extension in value.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-                if selected.replace(parse(extension)?).is_some() {
-                    return Err(invalid_header());
+            for extension in split_quoted(value, b',')? {
+                if let Some(params) = parse(extension)? {
+                    if selected.replace(params).is_some() {
+                        return Err(invalid_header());
+                    }
                 }
             }
         }
         let Some(params) = selected else { return Ok(None) };
-        if params.server_no_context_takeover != self.server_no_context_takeover {
+        if self.server_no_context_takeover && !params.server_no_context_takeover {
             return Err(invalid_header());
         }
         let mut agreed = self;
+        agreed.server_no_context_takeover = params.server_no_context_takeover;
         agreed.client_no_context_takeover |= params.client_no_context_takeover;
-        if let Some(bits) = params.server_max_window_bits {
-            agreed.server_max_window_bits = bits;
+        match params.server_max_window_bits {
+            Some(bits) if bits > self.server_max_window_bits => return Err(invalid_header()),
+            Some(bits) => agreed.server_max_window_bits = bits,
+            None if self.server_max_window_bits < 15 => return Err(invalid_header()),
+            None => {}
         }
         match params.client_max_window_bits {
             ClientWindow::NoValue => return Err(invalid_header()),
@@ -101,8 +112,8 @@ impl Settings {
 
     pub(crate) fn accept_offers(self, offers: &[HeaderValue]) -> Option<(Self, HeaderValue)> {
         for value in offers.iter().filter_map(|value| value.to_str().ok()) {
-            for extension in value.split(',').map(str::trim) {
-                if let Ok(offer) = parse(extension) {
+            for extension in split_quoted(value, b',').into_iter().flatten() {
+                if let Ok(Some(offer)) = parse(extension) {
                     if let Some(accepted) = self.accept_offer(offer) {
                         return Some(accepted);
                     }
@@ -318,23 +329,31 @@ enum ClientWindow {
     Bits(u8),
 }
 
-fn parse(extension: &str) -> Result<Params> {
-    let mut parts = extension.split(';');
-    if !parts.next().is_some_and(|name| name.trim().eq_ignore_ascii_case(NAME)) {
-        return Err(invalid_header());
+fn parse(extension: &str) -> Result<Option<Params>> {
+    let parts = split_quoted(extension, b';')?;
+    let name = parts.first().map_or("", |name| name.trim());
+    if name.is_empty() {
+        return if extension.trim().is_empty() { Ok(None) } else { Err(invalid_header()) };
+    }
+    if !name.eq_ignore_ascii_case(NAME) {
+        return Ok(None);
     }
     let mut parsed = Params::default();
-    for parameter in parts {
+    for parameter in &parts[1..] {
         let (name, value) = parameter
             .trim()
             .split_once('=')
             .map_or((parameter.trim(), None), |(name, value)| (name.trim(), Some(value.trim())));
-        let bit = match name {
-            "server_no_context_takeover" => 1,
-            "client_no_context_takeover" => 2,
-            "server_max_window_bits" => 4,
-            "client_max_window_bits" => 8,
-            _ => return Err(invalid_header()),
+        let bit = if name.eq_ignore_ascii_case("server_no_context_takeover") {
+            1
+        } else if name.eq_ignore_ascii_case("client_no_context_takeover") {
+            2
+        } else if name.eq_ignore_ascii_case("server_max_window_bits") {
+            4
+        } else if name.eq_ignore_ascii_case("client_max_window_bits") {
+            8
+        } else {
+            return Err(invalid_header());
         };
         if parsed.seen & bit != 0 {
             return Err(invalid_header());
@@ -355,27 +374,75 @@ fn parse(extension: &str) -> Result<Params> {
             _ => return Err(invalid_header()),
         }
     }
-    Ok(parsed)
+    Ok(Some(parsed))
 }
 
 fn parse_bits(value: &str) -> Result<u8> {
-    if value.len() > 1 && value.starts_with('0') {
+    let value = unquote(value)?;
+    if !value.bytes().all(|byte| byte.is_ascii_digit()) || value.len() > 1 && value.starts_with('0')
+    {
         return Err(invalid_header());
     }
     value.parse::<u8>().ok().filter(|bits| (8..=15).contains(bits)).ok_or_else(invalid_header)
+}
+
+fn split_quoted(value: &str, delimiter: u8) -> Result<Vec<&str>> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut quoted = false;
+    let mut escaped = false;
+    for (index, byte) in value.bytes().enumerate() {
+        if quoted {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                quoted = false;
+            }
+        } else if byte == b'"' {
+            quoted = true;
+        } else if byte == delimiter {
+            parts.push(&value[start..index]);
+            start = index + 1;
+        }
+    }
+    if quoted || escaped {
+        return Err(invalid_header());
+    }
+    parts.push(&value[start..]);
+    Ok(parts)
+}
+
+fn unquote(value: &str) -> Result<Cow<'_, str>> {
+    if !value.starts_with('"') {
+        return if value.contains('"') { Err(invalid_header()) } else { Ok(Cow::Borrowed(value)) };
+    }
+    let mut output = String::new();
+    let mut chars = value[1..].chars();
+    while let Some(character) = chars.next() {
+        match character {
+            '\\' => output.push(chars.next().ok_or_else(invalid_header)?),
+            '"' if chars.next().is_none() => return Ok(Cow::Owned(output)),
+            '"' => return Err(invalid_header()),
+            character => output.push(character),
+        }
+    }
+    Err(invalid_header())
 }
 
 fn invalid_header() -> Error {
     ProtocolError::InvalidHeader(SEC_WEBSOCKET_EXTENSIONS.clone().into()).into()
 }
 
-pub(crate) fn response_selects_deflate(headers: &HeaderMap) -> Result<bool> {
+pub(crate) fn headers_select_deflate(headers: &HeaderMap) -> Result<bool> {
     for value in headers.get_all(SEC_WEBSOCKET_EXTENSIONS) {
         let value = value.to_str().map_err(|_| invalid_header())?;
-        if value.split(',').any(|extension| {
-            extension.split(';').next().is_some_and(|name| name.trim().eq_ignore_ascii_case(NAME))
-        }) {
-            return Ok(true);
+        for extension in split_quoted(value, b',')? {
+            let name = split_quoted(extension, b';')?.into_iter().next().unwrap_or("").trim();
+            if name.eq_ignore_ascii_case(NAME) {
+                return Ok(true);
+            }
         }
     }
     Ok(false)
