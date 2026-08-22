@@ -1056,6 +1056,218 @@ impl<T> CheckConnectionReset for Result<T> {
     }
 }
 
+#[cfg(feature = "deflate")]
+#[cfg(test)]
+mod write_transaction {
+    use super::*;
+    use crate::Message;
+    use std::io;
+
+    /// A stream that keeps what was written, so a peer can decode it.
+    #[derive(Default)]
+    struct Recorder(Vec<u8>);
+
+    impl io::Write for Recorder {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl io::Read for Recorder {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    /// Sized so one message fits the write buffer and a second does not, which is
+    /// the only shape where a rejected write is retryable: a frame larger than
+    /// `max_write_buffer_size` fails admission on every retry forever.
+    fn server() -> WebSocket<Recorder> {
+        let config = WebSocketConfig::default()
+            // `write_buffer_size` must exceed the first message, or `write`
+            // auto-flushes it and the buffer is empty when the second arrives --
+            // in which case nothing is ever rejected and every arm is vacuous.
+            .write_buffer_size(400)
+            .max_write_buffer_size(500)
+            .enable_deflate();
+        WebSocket::from_raw_socket(Recorder::default(), Role::Server, Some(config))
+    }
+
+    /// Poorly compressible, so the buffer fills with real bytes. A compressible
+    /// filler would leave the buffer nearly empty while the preflight measures the
+    /// *plain* frame, and nothing would ever be rejected.
+    fn noise(len: usize, seed: u8) -> Vec<u8> {
+        // splitmix64. A linear sequence is not incompressible -- an earlier
+        // version of this helper used `i * 37 + seed` and deflate took 300 bytes
+        // down to 276, which silently defeated the sizing every arm depends on.
+        let mut x = u64::from(seed).wrapping_add(0x9E37_79B9_7F4A_7C15);
+        (0..len)
+            .map(|_| {
+                x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                let mut z = x;
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                (z ^ (z >> 31)) as u8
+            })
+            .collect()
+    }
+
+    fn decode_all(wire: &[u8]) -> Vec<Message> {
+        let config = WebSocketConfig::default().enable_deflate();
+        let mut peer =
+            WebSocket::from_raw_socket(io::Cursor::new(wire.to_vec()), Role::Client, Some(config));
+        let mut out = Vec::new();
+        while let Ok(message) = peer.read() {
+            out.push(message);
+        }
+        out
+    }
+
+    /// Fills the buffer, then offers a message the preflight must reject.
+    /// Returns the socket and the frame handed back.
+    fn reject_one(first: &[u8], second: &[u8]) -> (WebSocket<Recorder>, Frame) {
+        let mut socket = server();
+        socket.write(Message::binary(first.to_vec())).expect("the first message fits");
+
+        let returned = match socket.write(Message::binary(second.to_vec())) {
+            Err(Error::WriteBufferFull(message)) => match *message {
+                Message::Frame(frame) => frame,
+                other => panic!("WriteBufferFull must carry a frame, got {other:?}"),
+            },
+            other => panic!("the second message must be rejected, got {other:?}"),
+        };
+        assert!(
+            !returned.header().rsv1,
+            "the returned frame must be uncompressed, which is what makes every retry order safe"
+        );
+        (socket, returned)
+    }
+
+    /// The expansion branch: the plain frame fits, the compressed one does not.
+    ///
+    /// Incompressible input inflates slightly under deflate, so the window between
+    /// the two sizes is only a handful of bytes. Rather than guess it, compress the
+    /// payload with a throwaway context to learn the compressed length, then set
+    /// `max_write_buffer_size` to exactly the plain wire size — the preflight
+    /// admits it, the compressed frame overflows, and the branch fires.
+    ///
+    /// The reset in that branch is what this arm exists for. Without it the encoder
+    /// keeps a window containing a message the peer never inflated, because that
+    /// message went out uncompressed, and every later compressed frame references
+    /// history the peer does not have.
+    #[test]
+    fn arm_four_expansion_sends_plain_and_leaves_the_next_message_decodable() {
+        use crate::protocol::deflate::{Context, Settings};
+
+        let payload = noise(300, 7);
+        let compressed_len = Context::new(Role::Server, Settings::default())
+            .compress(&payload)
+            .expect("compress")
+            .len();
+        assert!(
+            compressed_len > payload.len(),
+            "the fixture must actually expand: {} -> {compressed_len}",
+            payload.len()
+        );
+
+        let plain_wire = Frame::message(payload.clone(), OpCode::Data(OpData::Binary), true).len();
+        let config = WebSocketConfig::default()
+            .write_buffer_size(plain_wire - 1)
+            .max_write_buffer_size(plain_wire)
+            .enable_deflate();
+        let mut socket =
+            WebSocket::from_raw_socket(Recorder::default(), Role::Server, Some(config));
+
+        socket
+            .write(Message::binary(payload.clone()))
+            .expect("the plain frame fits, so this must not be rejected");
+        socket.flush().expect("flush");
+
+        let after_expansion = socket.get_ref().0.len();
+        let first = decode_all(&socket.get_ref().0);
+        assert_eq!(
+            first,
+            vec![Message::binary(payload.clone())],
+            "the expansion branch must send the message uncompressed"
+        );
+
+        // A second message, now compressed, against a peer whose inflate window
+        // never saw the first. It has to *share bytes* with the first, or the
+        // encoder finds nothing to back-reference and a stale window is
+        // indistinguishable from a fresh one -- which is how an earlier version of
+        // this arm let the missing-reset mutant survive.
+        let second = payload[..120].to_vec();
+        socket.write(Message::binary(second.clone())).expect("second send");
+        socket.flush().expect("flush");
+
+        let tail = &socket.get_ref().0[after_expansion..];
+        assert_eq!(
+            decode_all(tail),
+            vec![Message::binary(second)],
+            "without the expansion reset the encoder references history the peer \
+             never received, and this decodes to garbage or fails"
+        );
+    }
+
+    #[test]
+    fn arm_one_immediate_retry_of_the_returned_frame() {
+        let (a, b) = (noise(300, 1), noise(300, 2));
+        let (mut socket, returned) = reject_one(&a, &b);
+        socket.flush().expect("draining makes room");
+        socket.write(Message::Frame(returned)).expect("the returned frame now fits");
+        socket.flush().expect("flush");
+
+        let decoded = decode_all(&socket.get_ref().0);
+        assert_eq!(decoded, vec![Message::binary(a.clone()), Message::binary(b.clone())]);
+    }
+
+    #[test]
+    fn arm_two_drop_the_returned_frame_then_send_another() {
+        let (a, b) = (noise(300, 1), noise(300, 2));
+        let (mut socket, returned) = reject_one(&a, &b);
+        drop(returned);
+        socket.flush().expect("flush");
+        let c = noise(150, 3);
+        socket.write(Message::binary(c.clone())).expect("a later message still sends");
+        socket.flush().expect("flush");
+
+        let decoded = decode_all(&socket.get_ref().0);
+        assert_eq!(
+            decoded,
+            vec![Message::binary(a.clone()), Message::binary(c.clone())],
+            "dropping the rejected message must not corrupt what follows"
+        );
+    }
+
+    #[test]
+    fn arm_three_another_message_first_then_retry_the_returned_frame() {
+        let (a, b) = (noise(300, 1), noise(300, 2));
+        let (mut socket, returned) = reject_one(&a, &b);
+        socket.flush().expect("flush");
+        let c = noise(150, 3);
+        socket.write(Message::binary(c.clone())).expect("send an intervening message");
+        socket.flush().expect("flush");
+        socket.write(Message::Frame(returned)).expect("retry after C");
+        socket.flush().expect("flush");
+
+        let decoded = decode_all(&socket.get_ref().0);
+        assert_eq!(
+            decoded,
+            vec![
+                Message::binary(a.clone()),
+                Message::binary(c.clone()),
+                Message::binary(b.clone())
+            ],
+            "the returned frame is uncompressed, so an intervening compressed \
+             message cannot shift its back-references"
+        );
+    }
+}
+
 #[cfg(test)]
 mod wire_size_tests {
     use super::*;
