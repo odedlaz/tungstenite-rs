@@ -1213,6 +1213,54 @@ mod write_transaction {
         );
     }
 
+    /// Admission is decided on the *uncompressed* size, which is what makes the
+    /// `max_write_buffer_size` contract true: a message whose plain wire form does
+    /// not fit is rejected even when its compressed form would have.
+    ///
+    /// This is the arm the incompressible fillers cannot reach. With noise, plain
+    /// and compressed both miss admission, so the expansion reset produces the same
+    /// outcome as the preflight and deleting the preflight is invisible. With a
+    /// highly compressible payload the two decisions disagree, and only the
+    /// preflight rejects.
+    #[test]
+    fn arm_five_a_large_compressible_message_is_rejected_on_its_plain_size() {
+        let payload = vec![b'z'; 400];
+        let plain_wire = Frame::message(payload.clone(), OpCode::Data(OpData::Binary), true).len();
+        let compressed_len = crate::protocol::deflate::Context::new(
+            Role::Server,
+            crate::protocol::deflate::Settings::default(),
+        )
+        .compress(&payload)
+        .expect("compress")
+        .len();
+        assert!(
+            compressed_len + 4 < 200 && plain_wire > 200,
+            "the fixture must straddle the cap: plain {plain_wire}, compressed {compressed_len}"
+        );
+
+        let config = WebSocketConfig::default()
+            .write_buffer_size(100)
+            .max_write_buffer_size(200)
+            .enable_deflate();
+        let mut socket =
+            WebSocket::from_raw_socket(Recorder::default(), Role::Server, Some(config));
+
+        match socket.write(Message::binary(payload.clone())) {
+            Err(Error::WriteBufferFull(message)) => match *message {
+                Message::Frame(frame) => {
+                    assert!(!frame.header().rsv1, "the returned frame must be the uncompressed one")
+                }
+                other => panic!("must carry a frame, got {other:?}"),
+            },
+            other => panic!(
+                "a message whose plain form exceeds the cap must be rejected even though \
+                 it compresses small enough to fit -- got {other:?}"
+            ),
+        }
+        socket.flush().expect("flush");
+        assert!(socket.get_ref().0.is_empty(), "nothing may reach the wire for a rejected message");
+    }
+
     #[test]
     fn arm_one_immediate_retry_of_the_returned_frame() {
         let (a, b) = (noise(300, 1), noise(300, 2));
