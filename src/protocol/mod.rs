@@ -1057,6 +1057,54 @@ impl<T> CheckConnectionReset for Result<T> {
 }
 
 #[cfg(test)]
+mod wire_size_tests {
+    use super::*;
+    use crate::protocol::frame::coding::{Data as OpData, OpCode};
+
+    /// The preflight admits a message by comparing `wire_size` against the write
+    /// buffer *before* compressing, so this number has to be the size the frame
+    /// will actually occupy — not the size it occupies now.
+    ///
+    /// The load-bearing term is the mask: a client frame is masked later, in
+    /// `buffer_frame`, so at preflight time it is four bytes smaller than it will
+    /// be on the wire. Undercounting by four would let a client overflow a bound
+    /// its caller chose, which is the whole thing the preflight exists to prevent.
+    ///
+    /// Lengths are the header-format boundaries: 0/125 take a 2-byte header, 126
+    /// and 65535 take 4, and 65536 takes 10.
+    #[test]
+    fn client_counts_the_mask_it_has_not_added_yet_at_every_header_boundary() {
+        for (payload, header) in [(0, 2), (125, 2), (126, 4), (65_535, 4), (65_536, 10)] {
+            let frame = Frame::message(vec![0u8; payload], OpCode::Data(OpData::Binary), true);
+            assert!(!frame.is_masked(), "a fresh frame is unmasked");
+            assert_eq!(frame.len(), header + payload, "payload {payload}");
+
+            assert_eq!(
+                wire_size(Role::Server, &frame),
+                header + payload,
+                "a server never masks, so wire size is the frame ({payload})"
+            );
+            assert_eq!(
+                wire_size(Role::Client, &frame),
+                header + payload + 4,
+                "a client masks at buffer time, so preflight must add 4 ({payload})"
+            );
+        }
+    }
+
+    /// Already-masked frames must not be charged twice -- the retry path admits a
+    /// `Message::Frame` that has been through `buffer_frame` before.
+    #[test]
+    fn an_already_masked_frame_is_not_charged_for_a_second_mask() {
+        let mut frame = Frame::message(vec![0u8; 8], OpCode::Data(OpData::Binary), true);
+        frame.set_random_mask();
+        assert!(frame.is_masked());
+        assert_eq!(wire_size(Role::Client, &frame), frame.len());
+        assert_eq!(wire_size(Role::Server, &frame), frame.len());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::{Message, Role, WebSocket, WebSocketConfig};
     use crate::error::{CapacityError, Error};
