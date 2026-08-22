@@ -269,14 +269,16 @@ impl<S: Read + Write, C: Callback> HandshakeRole for ServerHandshake<S, C> {
                     Ok(response) => {
                         #[cfg(feature = "deflate")]
                         let mut response = response;
+                        // A callback cannot advertise PMD even when it is disabled here:
+                        // the returned socket would have no codec for the state claimed by the 101.
+                        #[cfg(feature = "deflate")]
+                        if crate::protocol::deflate::headers_select_deflate(response.headers()) {
+                            return Err(Error::Protocol(ProtocolError::InvalidHeader(
+                                http::header::SEC_WEBSOCKET_EXTENSIONS.clone().into(),
+                            )));
+                        }
                         #[cfg(feature = "deflate")]
                         if self.config.as_ref().is_some_and(|config| config.deflate.is_some()) {
-                            if crate::protocol::deflate::headers_select_deflate(response.headers())
-                            {
-                                return Err(Error::Protocol(ProtocolError::InvalidHeader(
-                                    http::header::SEC_WEBSOCKET_EXTENSIONS.clone().into(),
-                                )));
-                            }
                             let offers = result
                                 .headers()
                                 .get_all(http::header::SEC_WEBSOCKET_EXTENSIONS)
@@ -424,6 +426,36 @@ mod tests {
                 || format!("{err:?}").to_lowercase().contains("sec-websocket-extensions"),
             "must name the header it rejected: {err:?}"
         );
+    }
+
+    /// Even when compression is disabled locally, a callback cannot advertise
+    /// PMD: the returned socket has no codec and would reject the first RSV1
+    /// frame sent under the apparently successful negotiation.
+    #[cfg(feature = "deflate")]
+    #[test]
+    fn a_callback_cannot_advertise_deflate_when_it_is_not_configured() {
+        let request = "GET /script.ws HTTP/1.1\r\n\
+             Host: foo.com\r\n\
+             Connection: upgrade\r\n\
+             Upgrade: websocket\r\n\
+             Sec-WebSocket-Version: 13\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+             Sec-WebSocket-Extensions: permessage-deflate\r\n\
+             \r\n";
+        let stream = MockStream {
+            read: std::io::Cursor::new(request.as_bytes().to_vec()),
+            written: Vec::new(),
+        };
+
+        let err = crate::accept_hdr_with_config(stream, InjectDeflate, None)
+            .expect_err("a response cannot advertise a codec the socket did not install");
+
+        assert!(matches!(
+            err,
+            crate::handshake::HandshakeError::Failure(Error::Protocol(
+                ProtocolError::InvalidHeader(_)
+            ))
+        ));
     }
 
     /// The control: the identical callback and config, injecting nothing, must
