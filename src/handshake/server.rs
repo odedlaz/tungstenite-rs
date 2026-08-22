@@ -452,6 +452,81 @@ mod tests {
         }
     }
 
+    /// A callback that deletes the agreed extension header the server just wrote.
+    #[cfg(feature = "deflate")]
+    struct StripExtensions;
+
+    #[cfg(feature = "deflate")]
+    impl super::Callback for StripExtensions {
+        fn on_request(
+            self,
+            _request: &Request,
+            mut response: crate::handshake::server::Response,
+        ) -> std::result::Result<
+            crate::handshake::server::Response,
+            crate::handshake::server::ErrorResponse,
+        > {
+            response.headers_mut().remove("Sec-WebSocket-Extensions");
+            Ok(response)
+        }
+    }
+
+    #[cfg(feature = "deflate")]
+    #[test]
+    fn callback_stripping_the_agreed_header_leaves_compression_installed() {
+        // Runtime extension state is installed before the callback runs, and the
+        // callback owns the response and may remove any header. So a callback that
+        // deletes `Sec-WebSocket-Extensions` produces a wire that says "no
+        // compression agreed" over a socket that compresses: every message goes out
+        // with RSV1 set to a peer that never agreed to read it.
+        //
+        // This asserts the divergence rather than the fix, because at this commit
+        // the divergence is what happens. The compact implementation must make the
+        // two commit together; when it does, this test inverts and the mutation that
+        // proves it is re-separating the header write from the state install.
+        use crate::extensions::{compression::deflate::DeflateConfig, ExtensionsConfig};
+
+        let request = "GET /script.ws HTTP/1.1\r\n\
+             Host: foo.com\r\n\
+             Connection: upgrade\r\n\
+             Upgrade: websocket\r\n\
+             Sec-WebSocket-Version: 13\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+             Sec-WebSocket-Extensions: permessage-deflate\r\n\
+             \r\n";
+        let stream = MockStream {
+            read: std::io::Cursor::new(request.as_bytes().to_vec()),
+            written: Vec::new(),
+        };
+        let config = crate::protocol::WebSocketConfig {
+            extensions: ExtensionsConfig { permessage_deflate: Some(DeflateConfig::default()) },
+            ..Default::default()
+        };
+
+        let mut socket = crate::accept_hdr_with_config(stream, StripExtensions, Some(config))
+            .expect("the handshake itself completes");
+
+        let handshake_len = socket.get_ref().written.len();
+        let response = String::from_utf8_lossy(&socket.get_ref().written).to_ascii_lowercase();
+        assert!(response.contains("101 switching protocols"), "{response}");
+        assert!(
+            !response.contains("sec-websocket-extensions"),
+            "the callback removed the header, so the wire agreed nothing: {response}"
+        );
+
+        socket.send(crate::Message::text("hello hello hello hello")).expect("send");
+        let frame = &socket.get_ref().written[handshake_len..];
+        let rsv1 = frame.first().expect("a frame was written") & 0x40 != 0;
+
+        assert!(
+            rsv1,
+            "documents the divergence at this commit: the socket must be compressing \
+             even though the response header was stripped. If this now fails, the \
+             header write and the state install have been made atomic -- invert the \
+             assertion and keep the test."
+        );
+    }
+
     #[test]
     fn request_parsing() {
         const DATA: &[u8] = b"GET /script.ws HTTP/1.1\r\nHost: foo.com\r\n\r\n";
