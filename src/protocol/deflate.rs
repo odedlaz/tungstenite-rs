@@ -515,8 +515,20 @@ mod bounds {
         assert!(wire.len() < 4096, "the fixture must actually be a bomb: {} bytes", wire.len());
 
         match client.decompress(&wire, true, 0, Some(8 * 1024)) {
-            Err(Error::Capacity(CapacityError::MessageTooLong { max_size, .. })) => {
+            Err(Error::Capacity(CapacityError::MessageTooLong { size, max_size })) => {
                 assert_eq!(max_size, 8 * 1024);
+                // `size` is the discriminator, not decoration. `writable` is
+                // `remaining + 1`, so detection happens on the first byte past the
+                // budget and the reported size is always exactly one over. Using
+                // `max_size` instead of `remaining` would let a call produce a
+                // whole 4 KiB scratch chunk before the check fires, and the same
+                // variant would carry a size thousands of bytes larger. The public
+                // error value is where per-call overshoot becomes observable.
+                assert_eq!(
+                    size,
+                    max_size + 1,
+                    "detection must happen one byte past the budget, not one chunk past it"
+                );
             }
             other => panic!("a bomb against a small budget must be rejected, got {other:?}"),
         }
