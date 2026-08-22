@@ -267,6 +267,36 @@ impl<S: Read + Write, C: Callback> HandshakeRole for ServerHandshake<S, C> {
 
                 match callback_result {
                     Ok(response) => {
+                        #[cfg(feature = "deflate")]
+                        let mut response = response;
+                        #[cfg(feature = "deflate")]
+                        if self.config.as_ref().is_some_and(|config| config.deflate.is_some()) {
+                            if crate::protocol::deflate::response_selects_deflate(
+                                response.headers(),
+                            )? {
+                                return Err(Error::Protocol(ProtocolError::InvalidHeader(
+                                    http::header::SEC_WEBSOCKET_EXTENSIONS.clone().into(),
+                                )));
+                            }
+                            let offers = result
+                                .headers()
+                                .get_all(http::header::SEC_WEBSOCKET_EXTENSIONS)
+                                .iter()
+                                .cloned()
+                                .collect::<Vec<_>>();
+                            let (config, agreed) = self
+                                .config
+                                .take()
+                                .expect("configured deflate has a websocket config")
+                                .accept_deflate_offers(&offers);
+                            self.config = Some(config);
+                            if let Some(agreed) = agreed {
+                                response
+                                    .headers_mut()
+                                    .append(http::header::SEC_WEBSOCKET_EXTENSIONS, agreed);
+                            }
+                        }
+
                         let mut output = vec![];
                         write_response(&mut output, &response)?;
                         ProcessingResult::Continue(HandshakeMachine::start_write(stream, output))

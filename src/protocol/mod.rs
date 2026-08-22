@@ -2,6 +2,9 @@
 
 pub mod frame;
 
+#[cfg(feature = "deflate")]
+pub(crate) mod deflate;
+
 mod message;
 
 pub use self::{frame::CloseFrame, message::Message};
@@ -74,6 +77,10 @@ pub struct WebSocketConfig {
     ///
     /// Note: Should always be at least [`write_buffer_size + 1 message`](Self::write_buffer_size)
     /// and probably a little more depending on error handling strategy.
+    /// With deflate enabled, “1 message” means its uncompressed full wire size;
+    /// a larger message is unsendable regardless of how much the buffer drains.
+    /// If compression expands after admission, the message is sent uncompressed
+    /// and outgoing takeover history is reset before later compressed output.
     pub max_write_buffer_size: usize,
     /// The maximum size of an incoming message. `None` means no size limit. The default value is 64 MiB
     /// which should be reasonably big for all normal use-cases but small enough to prevent
@@ -90,6 +97,8 @@ pub struct WebSocketConfig {
     /// some popular libraries that are sending unmasked frames, ignoring the RFC.
     /// By default this option is set to `false`, i.e. according to RFC 6455.
     pub accept_unmasked_frames: bool,
+    #[cfg(feature = "deflate")]
+    pub(crate) deflate: Option<deflate::Settings>,
 }
 
 impl Default for WebSocketConfig {
@@ -101,11 +110,105 @@ impl Default for WebSocketConfig {
             max_message_size: Some(64 << 20),
             max_frame_size: Some(16 << 20),
             accept_unmasked_frames: false,
+            #[cfg(feature = "deflate")]
+            deflate: None,
         }
     }
 }
 
 impl WebSocketConfig {
+    /// Offers `permessage-deflate` on this connection, with RFC 7692 defaults.
+    ///
+    /// A client offers the extension in its handshake; a server accepts an
+    /// offer only through [`accept_deflate_offers`]. Enabling it here is not a
+    /// promise that the peer agrees — the negotiated outcome is whatever the
+    /// handshake settles on, and a peer that declines leaves the connection
+    /// uncompressed.
+    ///
+    /// [`accept_deflate_offers`]: WebSocketConfig::accept_deflate_offers
+    #[cfg(feature = "deflate")]
+    pub fn enable_deflate(mut self) -> Self {
+        self.deflate.get_or_insert_default();
+        self
+    }
+
+    /// Caps the LZ77 sliding window for one direction, in bits.
+    ///
+    /// `role` selects the direction: [`Role::Server`] sets
+    /// `server_max_window_bits`, [`Role::Client`] sets `client_max_window_bits`.
+    /// Valid values are 9 to 15; smaller windows trade compression ratio for
+    /// memory, and this is the only knob that reduces per-connection memory.
+    ///
+    /// # Panics
+    /// Panics if `bits` is outside 9..=15.
+    #[cfg(feature = "deflate")]
+    pub fn deflate_max_window_bits(mut self, role: Role, bits: u8) -> Self {
+        self.deflate = Some(self.deflate.unwrap_or_default().max_window_bits(role, bits));
+        self
+    }
+
+    /// Requests that one direction reset its sliding window between messages.
+    ///
+    /// `role` selects the direction. Disabling context takeover costs most of
+    /// the compression ratio — it is the difference between compressing against
+    /// the whole conversation and compressing each message alone — and it does
+    /// not reduce steady-state memory, because resetting a stream reuses its
+    /// arena rather than freeing it. It is a ratio and CPU knob, not a memory
+    /// one; for memory use [`deflate_max_window_bits`].
+    ///
+    /// For a client, setting [`Role::Server`] to `true` is a hard requirement:
+    /// a response omitting `server_no_context_takeover` fails the handshake;
+    /// preference-plus-fallback is not supported. Per RFC 7692 §7.1.1.2, a
+    /// server may ignore this on the client's behalf.
+    ///
+    /// [`deflate_max_window_bits`]: WebSocketConfig::deflate_max_window_bits
+    #[cfg(feature = "deflate")]
+    pub fn deflate_no_context_takeover(mut self, role: Role, on: bool) -> Self {
+        self.deflate = Some(self.deflate.unwrap_or_default().no_context_takeover(role, on));
+        self
+    }
+
+    /// Sets the DEFLATE compression level, 0 (store) to 9 (maximum).
+    ///
+    /// Defaults to the backend's default. Levels above the default cost CPU for
+    /// a ratio gain that is small on short messages.
+    #[cfg(feature = "deflate")]
+    pub fn deflate_compression_level(mut self, level: u32) -> Self {
+        self.deflate = Some(self.deflate.unwrap_or_default().compression_level(level));
+        self
+    }
+
+    /// Answers a client's extension offers for a server-owned handshake.
+    ///
+    /// Takes every raw `Sec-WebSocket-Extensions` value from the request and
+    /// returns a socket-ready config plus the exact response header, if one was
+    /// agreed. On decline, the config has compression disabled and the header
+    /// is `None`.
+    ///
+    /// If a header is returned, send it and use the config returned with it;
+    /// applying only one would put the wire and codec into different states.
+    /// Pass that config to [`WebSocket::from_raw_socket`].
+    ///
+    /// A framework using tungstenite's own handshake needs only
+    /// [`enable_deflate`].
+    ///
+    /// [`enable_deflate`]: WebSocketConfig::enable_deflate
+    #[cfg(feature = "deflate")]
+    pub fn accept_deflate_offers(
+        mut self,
+        offers: &[http::HeaderValue],
+    ) -> (Self, Option<http::HeaderValue>) {
+        let accepted = self.deflate.and_then(|settings| settings.accept_offers(offers));
+        let response = accepted.map(|(settings, response)| {
+            self.deflate = Some(settings);
+            response
+        });
+        if response.is_none() {
+            self.deflate = None;
+        }
+        (self, response)
+    }
+
     /// Set [`Self::read_buffer_size`].
     pub fn read_buffer_size(mut self, read_buffer_size: usize) -> Self {
         self.read_buffer_size = read_buffer_size;
@@ -375,6 +478,10 @@ pub struct WebSocketContext {
     unflushed_additional: bool,
     /// The configuration for the websocket session.
     config: WebSocketConfig,
+    #[cfg(feature = "deflate")]
+    deflate: Option<deflate::Context>,
+    #[cfg(feature = "deflate")]
+    compressed_incomplete: bool,
 }
 
 impl WebSocketContext {
@@ -400,6 +507,8 @@ impl WebSocketContext {
         config.assert_valid();
         frame.set_max_out_buffer_len(config.max_write_buffer_size);
         frame.set_out_buffer_write_len(config.write_buffer_size);
+        #[cfg(feature = "deflate")]
+        let deflate = config.deflate.map(|settings| deflate::Context::new(role, settings));
         Self {
             role,
             frame,
@@ -408,6 +517,10 @@ impl WebSocketContext {
             additional_send: None,
             unflushed_additional: false,
             config,
+            #[cfg(feature = "deflate")]
+            deflate,
+            #[cfg(feature = "deflate")]
+            compressed_incomplete: false,
         }
     }
 
@@ -415,8 +528,24 @@ impl WebSocketContext {
     ///
     /// # Panics
     /// Panics if config is invalid e.g. `max_write_buffer_size <= write_buffer_size`.
+    #[cfg(not(feature = "deflate"))]
     pub fn set_config(&mut self, set_func: impl FnOnce(&mut WebSocketConfig)) {
         set_func(&mut self.config);
+        self.config.assert_valid();
+        self.frame.set_max_out_buffer_len(self.config.max_write_buffer_size);
+        self.frame.set_out_buffer_write_len(self.config.write_buffer_size);
+    }
+
+    /// Change the configuration without changing the negotiated compression state.
+    ///
+    /// # Panics
+    /// Panics if config is invalid or the callback changes agreed deflate settings.
+    #[cfg(feature = "deflate")]
+    pub fn set_config(&mut self, set_func: impl FnOnce(&mut WebSocketConfig)) {
+        let mut candidate = self.config;
+        set_func(&mut candidate);
+        assert_eq!(candidate.deflate, self.config.deflate, "agreed deflate settings are immutable");
+        self.config = candidate;
         self.config.assert_valid();
         self.frame.set_max_out_buffer_len(self.config.max_write_buffer_size);
         self.frame.set_out_buffer_write_len(self.config.write_buffer_size);
@@ -500,9 +629,35 @@ impl WebSocketContext {
             return Err(Error::Protocol(ProtocolError::SendAfterClosing));
         }
 
+        let prepare_data = |this: &mut Self, data, opcode| -> Result<Frame> {
+            #[cfg(not(feature = "deflate"))]
+            let _ = &this;
+            let plain = Frame::message(data, OpCode::Data(opcode), true);
+            #[cfg(feature = "deflate")]
+            if let Some(deflate) = &mut this.deflate {
+                if !this.frame.can_buffer(wire_size(this.role, &plain)) {
+                    return Err(Error::WriteBufferFull(Message::Frame(plain).into()));
+                }
+                let compressed = match deflate.compress(plain.payload()) {
+                    Ok(compressed) => compressed,
+                    Err(error) => {
+                        deflate.reset_encoder();
+                        return Err(error);
+                    }
+                };
+                let mut frame = Frame::message(compressed, OpCode::Data(opcode), true);
+                frame.header_mut().rsv1 = true;
+                if this.frame.can_buffer(wire_size(this.role, &frame)) {
+                    return Ok(frame);
+                }
+                deflate.reset_encoder();
+            }
+            Ok(plain)
+        };
+
         let frame = match message {
-            Message::Text(data) => Frame::message(data, OpCode::Data(OpData::Text), true),
-            Message::Binary(data) => Frame::message(data, OpCode::Data(OpData::Binary), true),
+            Message::Text(data) => prepare_data(self, data.into(), OpData::Text)?,
+            Message::Binary(data) => prepare_data(self, data, OpData::Binary)?,
             Message::Ping(data) => Frame::ping(data),
             Message::Pong(data) => {
                 self.set_additional(Frame::pong(data));
@@ -629,6 +784,8 @@ impl WebSocketContext {
             }
             Some(frame) => frame,
         };
+        #[cfg(feature = "deflate")]
+        let mut frame = frame;
 
         if !self.state.can_read() {
             return Err(Error::Protocol(ProtocolError::ReceivedAfterClosing));
@@ -640,7 +797,20 @@ impl WebSocketContext {
         // Connection_.
         {
             let hdr = frame.header();
-            if hdr.rsv1 || hdr.rsv2 || hdr.rsv3 {
+            let invalid_rsv1 = if hdr.rsv1 {
+                #[cfg(feature = "deflate")]
+                {
+                    self.deflate.is_none()
+                        || !matches!(hdr.opcode, OpCode::Data(OpData::Text | OpData::Binary))
+                }
+                #[cfg(not(feature = "deflate"))]
+                {
+                    true
+                }
+            } else {
+                false
+            };
+            if invalid_rsv1 || hdr.rsv2 || hdr.rsv3 {
                 return Err(Error::Protocol(ProtocolError::NonZeroReservedBits));
             }
         }
@@ -648,6 +818,35 @@ impl WebSocketContext {
         if self.role == Role::Client && frame.is_masked() {
             // A client MUST close a connection if it detects a masked frame. (RFC 6455)
             return Err(Error::Protocol(ProtocolError::MaskedFrameFromServer));
+        }
+
+        #[cfg(feature = "deflate")]
+        if let OpCode::Data(data) = frame.header().opcode {
+            let final_frame = frame.header().is_final;
+            let compressed = match data {
+                OpData::Text | OpData::Binary => frame.header().rsv1,
+                OpData::Continue => self.compressed_incomplete,
+                OpData::Reserved(_) => false,
+            };
+            if compressed {
+                let already = self.incomplete.as_ref().map(IncompleteMessage::len).unwrap_or(0);
+                let payload = self.deflate.as_mut().unwrap().decompress(
+                    frame.payload(),
+                    final_frame,
+                    already,
+                    self.config.max_message_size,
+                )?;
+                let mut header = frame.header().clone();
+                header.rsv1 = false;
+                frame = Frame::from_payload(header, payload);
+            }
+            match data {
+                OpData::Text | OpData::Binary if !final_frame => {
+                    self.compressed_incomplete = compressed;
+                }
+                OpData::Continue if final_frame => self.compressed_incomplete = false,
+                _ => {}
+            }
         }
 
         match frame.header().opcode {
@@ -756,6 +955,9 @@ impl WebSocketContext {
     where
         Stream: Read + Write,
     {
+        if !self.frame.can_buffer(wire_size(self.role, &frame)) {
+            return Err(Error::WriteBufferFull(Message::Frame(frame).into()));
+        }
         match self.role {
             Role::Server => {}
             Role::Client => {
@@ -779,6 +981,10 @@ impl WebSocketContext {
             self.additional_send.replace(add);
         }
     }
+}
+
+fn wire_size(role: Role, frame: &Frame) -> usize {
+    frame.len() + usize::from(role == Role::Client && !frame.is_masked()) * 4
 }
 
 fn check_max_size(size: usize, max_size: Option<usize>) -> crate::Result<()> {

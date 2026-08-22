@@ -54,6 +54,9 @@ pub enum Error {
     #[error("WebSocket protocol error: {0}")]
     Protocol(#[from] ProtocolError),
     /// Message write buffer is full.
+    ///
+    /// With deflate enabled, the returned frame is uncompressed and may be
+    /// retried in any order or dropped without changing compression history.
     #[error("Write buffer is full")]
     WriteBufferFull(Box<Message>),
     /// UTF coding error.
@@ -170,6 +173,10 @@ pub enum SubProtocolError {
 #[allow(missing_copy_implementations)]
 #[derive(Error, Debug, PartialEq, Eq, Clone)]
 pub enum ProtocolError {
+    /// Compression, decompression, or codec progress failed.
+    #[cfg(feature = "deflate")]
+    #[error("Compression failed")]
+    Compression,
     /// Use of the wrong HTTP method (the WebSocket protocol requires the GET method be used).
     #[error("Unsupported HTTP method used - only GET is allowed")]
     WrongHttpMethod,

@@ -44,6 +44,8 @@ impl<S: Read + Write> ClientHandshake<S> {
         request: Request,
         config: Option<WebSocketConfig>,
     ) -> Result<MidHandshake<Self>> {
+        #[cfg(feature = "deflate")]
+        let mut request = request;
         if request.method() != http::Method::GET {
             return Err(Error::Protocol(ProtocolError::WrongHttpMethod));
         }
@@ -56,6 +58,11 @@ impl<S: Read + Write> ClientHandshake<S> {
         let _ = crate::client::uri_mode(request.uri())?;
 
         let subprotocols = extract_subprotocols_from_request(&request)?;
+
+        #[cfg(feature = "deflate")]
+        if let Some(offer) = config.as_ref().and_then(|config| config.deflate.map(|d| d.offer())) {
+            request.headers_mut().append("Sec-WebSocket-Extensions", offer);
+        }
 
         // Convert and verify the `http::Request` and turn it into the request as per RFC.
         // Also extract the key from it (it must be present in a correct request).
@@ -98,6 +105,12 @@ impl<S: Read + Write> HandshakeRole for ClientHandshake<S> {
                     }
                     Err(e) => return Err(e),
                 };
+
+                #[cfg(feature = "deflate")]
+                if let Some(config) = self.config.as_mut() {
+                    config.deflate =
+                        self.verify_data.verify_deflate_response(&result, config.deflate)?;
+                }
 
                 debug!("Client handshake done.");
                 let websocket =
@@ -293,6 +306,18 @@ impl VerifyData {
 
         Ok(response)
     }
+
+    #[cfg(feature = "deflate")]
+    fn verify_deflate_response(
+        &self,
+        response: &Response,
+        offered: Option<crate::protocol::deflate::Settings>,
+    ) -> Result<Option<crate::protocol::deflate::Settings>> {
+        match offered {
+            Some(offered) => offered.accept_response(response.headers()),
+            None => Ok(None),
+        }
+    }
 }
 
 impl TryParse for Response {
@@ -337,6 +362,61 @@ pub fn generate_key() -> String {
 mod tests {
     use super::{super::machine::TryParse, generate_key, generate_request, Response};
     use crate::client::IntoClientRequest;
+
+    #[cfg(feature = "deflate")]
+    #[test]
+    fn client_response_validation() {
+        use super::VerifyData;
+        use crate::{
+            error::ProtocolError,
+            protocol::{deflate::Settings, Role},
+            Error,
+        };
+
+        let accept = crate::handshake::derive_accept_key(b"dGhlIHNhbXBsZSBub25jZQ==");
+        let verify = VerifyData { accept_key: accept.clone(), subprotocols: None };
+        let response = |header: Option<&str>, offered: Settings| {
+            let mut response = http::Response::builder()
+                .status(101)
+                .header("Connection", "Upgrade")
+                .header("Upgrade", "websocket")
+                .header("Sec-WebSocket-Accept", accept.clone());
+            if let Some(header) = header {
+                response = response.header("Sec-WebSocket-Extensions", header);
+            }
+            let response = verify.verify_response(response.body(None).unwrap())?;
+            verify.verify_deflate_response(&response, Some(offered))
+        };
+        let invalid = |header| {
+            matches!(
+                response(Some(header), Settings::default()),
+                Err(Error::Protocol(ProtocolError::InvalidHeader(_)))
+            )
+        };
+
+        assert!(response(None, Settings::default()).unwrap().is_none());
+        assert!(response(Some(""), Settings::default()).unwrap().is_none());
+        assert!(invalid(";x"));
+        assert!(invalid("permessage-deflate; client_max_window_bits"));
+        assert!(invalid("permessage-deflate; client_max_window_bits=09"));
+        assert!(response(
+            Some("permessage-deflate; server_max_window_bits=8"),
+            Settings::default()
+        )
+        .unwrap()
+        .is_some());
+        assert!(response(
+            Some("permessage-deflate"),
+            Settings::default().no_context_takeover(Role::Server, true)
+        )
+        .is_err());
+        assert!(response(
+            Some("permessage-deflate"),
+            Settings::default().no_context_takeover(Role::Client, true)
+        )
+        .unwrap()
+        .is_some());
+    }
 
     #[test]
     fn random_keys() {
