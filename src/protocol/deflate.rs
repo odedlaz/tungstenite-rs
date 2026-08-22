@@ -415,8 +415,11 @@ mod bounds {
         let wire = server.compress(&payload).expect("compress");
         match client.decompress(&wire, true, 0, Some(payload.len() - 1)) {
             Err(Error::Capacity(CapacityError::MessageTooLong { size, max_size })) => {
-                assert_eq!(max_size, payload.len() - 1);
-                assert!(size > max_size, "the reported size must exceed the limit");
+                // `size > max_size` would be a tautology -- the error is only
+                // constructed when that holds -- and echoing `max_size` back
+                // asserts an input. The invariant with content is that detection
+                // happens on the first byte past the budget.
+                assert_eq!(size, max_size + 1, "detection must be one byte past the budget");
             }
             other => panic!("one byte over the limit must be MessageTooLong, got {other:?}"),
         }
@@ -433,7 +436,12 @@ mod bounds {
 
         // Same message, same limit, but half of it is already accounted for.
         match client.decompress(&wire, true, 1500, Some(payload.len())) {
-            Err(Error::Capacity(CapacityError::MessageTooLong { .. })) => {}
+            Err(Error::Capacity(CapacityError::MessageTooLong { size, max_size })) => {
+                // The reported size has to include the earlier frames' bytes, or
+                // the budget is being applied per frame rather than per message.
+                assert_eq!(size, max_size + 1, "`already` must be inside the reported size");
+                assert!(size > 1500, "the earlier frame's 1500 bytes must be counted");
+            }
             other => panic!("`already` must consume the budget, got {other:?}"),
         }
     }
@@ -449,7 +457,6 @@ mod bounds {
 
         match client.decompress(&wire, true, 0, Some(8 * 1024)) {
             Err(Error::Capacity(CapacityError::MessageTooLong { size, max_size })) => {
-                assert_eq!(max_size, 8 * 1024);
                 // `size` is the discriminator, not decoration. `writable` is
                 // `remaining + 1`, so detection happens on the first byte past the
                 // budget and the reported size is always exactly one over. Using
