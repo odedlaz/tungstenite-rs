@@ -55,8 +55,11 @@ pub enum Error {
     Protocol(#[from] ProtocolError),
     /// Message write buffer is full.
     ///
-    /// With deflate enabled, the returned frame is uncompressed and may be
-    /// retried in any order or dropped without changing compression history.
+    /// With deflate enabled, a frame prepared from [`Message::Text`] or
+    /// [`Message::Binary`] is returned uncompressed and may be retried in any
+    /// order or dropped without changing compression history. A caller-supplied
+    /// [`Message::Frame`] is returned unchanged, and its compression history
+    /// remains the caller's responsibility.
     #[error("Write buffer is full")]
     WriteBufferFull(Box<Message>),
     /// UTF coding error.
