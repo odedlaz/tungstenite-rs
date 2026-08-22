@@ -339,6 +339,67 @@ impl DeflateDecompress {
 }
 
 #[cfg(test)]
+mod context_takeover_asymmetry {
+    use super::*;
+
+    // `server_no_context_takeover` drives two different resets: the server's own
+    // compressor, and the client's decompressor for that direction. Giving two
+    // contexts opposite values for that one field is therefore the only way to
+    // build a compressor/decompressor pair that disagrees about history -- which
+    // is the state a reset-after-rejected-write would leave a connection in.
+    fn pair(encoder_resets: bool, decoder_resets: bool) -> (DeflateContext, DeflateContext) {
+        let cfg = |v| DeflateConfig::default().set_no_context_takeover(Role::Server, v);
+        (
+            DeflateContext::new(Role::Server, cfg(encoder_resets)),
+            DeflateContext::new(Role::Client, cfg(decoder_resets)),
+        )
+    }
+
+    const REPEATED: &[u8] = b"the quick brown fox jumps over the lazy dog, at length";
+    const UNRELATED: &[u8] = b"a wholly different payload sharing no prefix, xyzzy";
+
+    /// An encoder that resets stays decodable by a peer that keeps history.
+    ///
+    /// This is the property that decides whether resetting after a rejected
+    /// write repairs the dropped-message case: the encoder starts from an empty
+    /// window, so it cannot reference the message the peer never received.
+    #[test]
+    fn resetting_encoder_stays_decodable_by_a_peer_keeping_history() {
+        let (mut encoder, mut decoder) = pair(true, false);
+
+        for (i, payload) in [REPEATED, REPEATED, REPEATED, UNRELATED].iter().enumerate() {
+            let wire = encoder.compress(payload).expect("compress");
+            let out = decoder
+                .decompress(&wire, true, usize::MAX)
+                .unwrap_or_else(|e| panic!("message {i} failed to decode: {e:?}"));
+            assert_eq!(out.as_ref(), *payload, "message {i} round-trip");
+        }
+    }
+
+    /// The control, and the test above is vacuous without it: the same harness
+    /// must be able to *observe* a desync, or a pass proves only that it cannot
+    /// see one. Reversing the asymmetry breaks decoding from the second message
+    /// -- the first still succeeds because there is no history to lose yet.
+    #[test]
+    fn control_resetting_decoder_desyncs_against_an_encoder_keeping_history() {
+        let (mut encoder, mut decoder) = pair(false, true);
+
+        let first = encoder.compress(REPEATED).expect("compress");
+        assert_eq!(
+            decoder.decompress(&first, true, usize::MAX).expect("first decodes").as_ref(),
+            REPEATED,
+            "the first message has no prior history to depend on"
+        );
+
+        let second = encoder.compress(REPEATED).expect("compress");
+        assert!(
+            decoder.decompress(&second, true, usize::MAX).is_err(),
+            "a decoder that discarded its window must fail on history-referencing input"
+        );
+    }
+}
+
+#[cfg(test)]
 pub(crate) mod test {
     use rand::{distr::Distribution as _, Rng as _, SeedableRng as _};
 
