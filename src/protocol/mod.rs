@@ -1058,6 +1058,94 @@ impl<T> CheckConnectionReset for Result<T> {
 
 #[cfg(feature = "deflate")]
 #[cfg(test)]
+mod rfc_7692_section_6_1 {
+    use super::*;
+    use crate::error::ProtocolError;
+    use std::io::{self, Cursor};
+
+    /// Read-only duplex: these rows drive `read()` over fixed frame bytes.
+    struct Incoming(Cursor<Vec<u8>>);
+
+    impl io::Read for Incoming {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            io::Read::read(&mut self.0, buf)
+        }
+    }
+
+    impl io::Write for Incoming {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The ported §6.1 rows. At `705e0cb` these were three tests against three
+    /// separate guards and three distinct error variants; the compact tree
+    /// collapses all of it into one `invalid_rsv1` decision reporting
+    /// `NonZeroReservedBits`, per `delete-error-fanout`. So the three rows stay
+    /// three rows -- one per rule -- but they now pin one variant.
+    fn reads_as_reserved_bits_error(frames: &[u8], deflate: bool) {
+        let config = if deflate {
+            WebSocketConfig::default().enable_deflate()
+        } else {
+            WebSocketConfig::default()
+        };
+        let mut socket = WebSocket::from_raw_socket(
+            Incoming(Cursor::new(frames.to_vec())),
+            Role::Client,
+            Some(config),
+        );
+        assert!(
+            matches!(
+                socket.read().unwrap_err(),
+                Error::Protocol(ProtocolError::NonZeroReservedBits)
+            ),
+            "RSV1 must be rejected here"
+        );
+    }
+
+    /// RSV1 with no extension negotiated: nothing defines the bit's meaning.
+    #[test]
+    fn rsv1_without_a_negotiated_extension_is_rejected() {
+        reads_as_reserved_bits_error(&[0x41, 0x03, 0xf2, 0x48, 0xcd], false);
+    }
+
+    /// RSV1 on a control frame, negotiated or not. FIN + RSV1 + Ping, empty.
+    #[test]
+    fn rsv1_on_a_control_frame_is_rejected() {
+        reads_as_reserved_bits_error(&[0xc9, 0x00], true);
+    }
+
+    /// RSV1 on a continuation: §6.1 allows the bit only on the first fragment.
+    /// The two-frame message from RFC 7692 §7.2.3.2 with RSV1 set on the second.
+    #[test]
+    fn rsv1_on_a_continuation_frame_is_rejected() {
+        reads_as_reserved_bits_error(
+            &[0x41, 0x03, 0xf2, 0x48, 0xcd, 0xc0, 0x04, 0xc9, 0xc9, 0x07, 0x00],
+            true,
+        );
+    }
+
+    /// The control, without which the three rows above could pass because
+    /// everything errors: the same first fragment plus a *clean* continuation is
+    /// a legal compressed message and must decode.
+    #[test]
+    fn control_the_same_message_without_rsv1_on_the_continuation_decodes() {
+        let mut socket = WebSocket::from_raw_socket(
+            Incoming(Cursor::new(vec![
+                0x41, 0x03, 0xf2, 0x48, 0xcd, 0x80, 0x04, 0xc9, 0xc9, 0x07, 0x00,
+            ])),
+            Role::Client,
+            Some(WebSocketConfig::default().enable_deflate()),
+        );
+        assert_eq!(socket.read().expect("a legal compressed message"), Message::text("Hello"));
+    }
+}
+
+#[cfg(feature = "deflate")]
+#[cfg(test)]
 mod write_transaction {
     use super::*;
     use crate::Message;

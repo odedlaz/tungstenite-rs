@@ -343,6 +343,119 @@ mod tests {
     use super::{super::machine::TryParse, create_response, Request};
     use crate::error::{Error, ProtocolError};
 
+    /// A duplex over a fixed request, so `accept_hdr_with_config` runs without a
+    /// socket.
+    #[cfg(feature = "deflate")]
+    #[derive(Debug)]
+    struct MockStream {
+        read: std::io::Cursor<Vec<u8>>,
+        written: Vec<u8>,
+    }
+
+    #[cfg(feature = "deflate")]
+    impl std::io::Read for MockStream {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            std::io::Read::read(&mut self.read, buf)
+        }
+    }
+
+    #[cfg(feature = "deflate")]
+    impl std::io::Write for MockStream {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.written.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A callback that adds an extension header the client never offered.
+    #[cfg(feature = "deflate")]
+    struct InjectDeflate;
+
+    #[cfg(feature = "deflate")]
+    impl super::Callback for InjectDeflate {
+        fn on_request(
+            self,
+            _request: &Request,
+            mut response: super::Response,
+        ) -> std::result::Result<super::Response, super::ErrorResponse> {
+            response.headers_mut().insert(
+                http::header::SEC_WEBSOCKET_EXTENSIONS,
+                http::HeaderValue::from_static("permessage-deflate"),
+            );
+            Ok(response)
+        }
+    }
+
+    /// The callback runs before negotiation, so it cannot *remove* an agreed
+    /// header -- that direction is impossible by construction. It can still
+    /// **inject** one, and only the explicit check catches that.
+    ///
+    /// Without it the `101` advertises compression while `accept_deflate_offers`
+    /// correctly installs none, because the request offered nothing: the wire and
+    /// the codec disagree with nothing red. That is the same divergence class as
+    /// the callback-removal defect at `705e0cb`, reached from the other side.
+    #[cfg(feature = "deflate")]
+    #[test]
+    fn a_callback_injecting_an_extension_header_fails_the_handshake() {
+        let request = "GET /script.ws HTTP/1.1\r\n\
+             Host: foo.com\r\n\
+             Connection: upgrade\r\n\
+             Upgrade: websocket\r\n\
+             Sec-WebSocket-Version: 13\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+             \r\n";
+        let stream = MockStream {
+            read: std::io::Cursor::new(request.as_bytes().to_vec()),
+            written: Vec::new(),
+        };
+
+        let err = crate::accept_hdr_with_config(
+            stream,
+            InjectDeflate,
+            Some(crate::protocol::WebSocketConfig::default().enable_deflate()),
+        )
+        .expect_err("an injected extension header must fail the handshake");
+
+        assert!(
+            format!("{err}").contains("Sec-WebSocket-Extensions")
+                || format!("{err:?}").to_lowercase().contains("sec-websocket-extensions"),
+            "must name the header it rejected: {err:?}"
+        );
+    }
+
+    /// The control: the identical callback and config, injecting nothing, must
+    /// complete. Otherwise the row above could pass because this path always
+    /// fails.
+    #[cfg(feature = "deflate")]
+    #[test]
+    fn control_the_same_path_without_injection_completes() {
+        let request = "GET /script.ws HTTP/1.1\r\n\
+             Host: foo.com\r\n\
+             Connection: upgrade\r\n\
+             Upgrade: websocket\r\n\
+             Sec-WebSocket-Version: 13\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+             \r\n";
+        let stream = MockStream {
+            read: std::io::Cursor::new(request.as_bytes().to_vec()),
+            written: Vec::new(),
+        };
+        let socket = crate::accept_with_config(
+            stream,
+            Some(crate::protocol::WebSocketConfig::default().enable_deflate()),
+        )
+        .expect("no injection, so the handshake completes");
+        let response = String::from_utf8_lossy(&socket.get_ref().written).to_ascii_lowercase();
+        assert!(response.contains("101 switching protocols"), "{response}");
+        assert!(
+            !response.contains("sec-websocket-extensions"),
+            "nothing was offered, so nothing is echoed: {response}"
+        );
+    }
+
     fn request_with_key(key: &str) -> Request {
         let data = format!(
             "\
