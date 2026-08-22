@@ -380,3 +380,40 @@ pub(crate) fn response_selects_deflate(headers: &HeaderMap) -> Result<bool> {
     }
     Ok(false)
 }
+
+#[cfg(test)]
+mod liveness {
+    use super::*;
+
+    /// `progress` is the only thing standing between a stalled codec and an
+    /// unbounded loop, so every cell of its table is pinned. Zero progress with
+    /// `Ok` is the stall: the backend claims success and consumed and produced
+    /// nothing, so the caller would spin forever. `BufError`/`StreamEnd` with
+    /// zero progress is ordinary termination.
+    ///
+    /// Deliberately a pure function rather than a driven loop: a mutant that
+    /// removes the guard makes this row *fail*, where a loop-based test would
+    /// hang and `cargo test` has no per-test timeout.
+    #[test]
+    fn zero_progress_on_ok_is_the_only_error_row() {
+        for (status, consumed, produced, expected) in [
+            (Status::Ok, 0, 0, None),
+            (Status::Ok, 1, 0, Some(true)),
+            (Status::Ok, 0, 1, Some(true)),
+            (Status::BufError, 0, 0, Some(false)),
+            (Status::BufError, 1, 0, Some(true)),
+            (Status::StreamEnd, 0, 0, Some(false)),
+            (Status::StreamEnd, 0, 1, Some(true)),
+        ] {
+            match (progress(status, consumed, produced), expected) {
+                (Ok(got), Some(want)) => {
+                    assert_eq!(got, want, "progress({status:?}, {consumed}, {produced})")
+                }
+                (Err(Error::Protocol(ProtocolError::Compression)), None) => {}
+                (got, want) => panic!(
+                    "progress({status:?}, {consumed}, {produced}) gave {got:?}, wanted {want:?}"
+                ),
+            }
+        }
+    }
+}
