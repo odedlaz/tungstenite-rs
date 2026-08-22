@@ -452,8 +452,12 @@ mod tests {
     #[cfg(feature = "deflate")]
     #[test]
     fn absent_and_empty_extension_headers_agree_and_a_malformed_one_does_not() {
-        // Records the three response shapes: absent, present but naming nothing,
-        // and unparseable. Only the third is a protocol error.
+        // Records the four response shapes: absent, present but naming nothing,
+        // undecodable, and decodable-but-invalid. The last two are both protocol
+        // errors and they come from different places -- the header decode in this
+        // function, and parameter validation inside `verify_agreed_on` -- so a
+        // replacement that collapses them would go unnoticed by a test that only
+        // asserted "some error".
         //
         // The first two are *observationally identical* here -- every arm of the
         // match below maps an empty agreed set to `Extensions::default()` -- so
@@ -465,12 +469,15 @@ mod tests {
         // (RFC 7692 section 7); the discriminating test belongs with that
         // validator, not here.
         use super::VerifyData;
-        use crate::extensions::{compression::deflate::DeflateConfig, ExtensionsConfig};
+        use crate::{
+            error::ProtocolError,
+            extensions::{compression::deflate::DeflateConfig, ExtensionsConfig, ExtensionsError},
+            Error,
+        };
 
         let key = "dGhlIHNhbXBsZSBub25jZQ==";
         let accept = crate::handshake::derive_accept_key(key.as_bytes());
-        let offered =
-            ExtensionsConfig { permessage_deflate: Some(DeflateConfig::default()) };
+        let offered = ExtensionsConfig { permessage_deflate: Some(DeflateConfig::default()) };
 
         let negotiated = |extensions_header: Option<&str>| {
             let mut builder = http::Response::builder()
@@ -491,18 +498,31 @@ mod tests {
                 .map(|(_, mut extensions)| extensions.per_message_compressor().is_some())
         };
 
-        assert_eq!(
-            negotiated(None).expect("an absent header is not an error"),
-            false,
+        assert!(
+            !negotiated(None).expect("an absent header is not an error"),
             "absent header must leave compression off"
         );
-        assert_eq!(
-            negotiated(Some("")).expect("a header naming no extension is not an error"),
-            false,
+        assert!(
+            !negotiated(Some("")).expect("a header naming no extension is not an error"),
             "present-but-empty header must agree with absent"
         );
-        negotiated(Some("permessage-deflate; client_max_window_bits=not-a-number"))
-            .expect_err("an unparseable header must stay a protocol error");
+        // A value `http` accepts but this header's grammar does not: the decode
+        // in `verify_response` fails and names the header. Nothing else in the
+        // crate covers this route.
+        assert!(
+            matches!(negotiated(Some(";x")), Err(Error::Protocol(ProtocolError::InvalidHeader(_)))),
+            "an undecodable header must fail as InvalidHeader"
+        );
+
+        // Decodes cleanly -- `not-a-number` is a legal token -- so this one gets
+        // past the decode and fails in parameter validation instead.
+        match negotiated(Some("permessage-deflate; client_max_window_bits=not-a-number")) {
+            Err(Error::Protocol(ProtocolError::InvalidExtensionsHeader(e))) => assert!(
+                matches!(*e, ExtensionsError::MalformedExtension(_)),
+                "expected a malformed-extension validation failure, got {e:?}"
+            ),
+            other => panic!("expected a validation failure, got {other:?}"),
+        }
     }
 
     #[cfg(feature = "deflate")]
