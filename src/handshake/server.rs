@@ -374,7 +374,7 @@ mod tests {
 
     /// A callback that adds an extension header the client never offered.
     #[cfg(feature = "deflate")]
-    struct InjectDeflate;
+    struct InjectDeflate(&'static str);
 
     #[cfg(feature = "deflate")]
     impl super::Callback for InjectDeflate {
@@ -385,7 +385,7 @@ mod tests {
         ) -> std::result::Result<super::Response, super::ErrorResponse> {
             response.headers_mut().insert(
                 http::header::SEC_WEBSOCKET_EXTENSIONS,
-                http::HeaderValue::from_static("permessage-deflate"),
+                http::HeaderValue::from_static(self.0),
             );
             Ok(response)
         }
@@ -409,23 +409,23 @@ mod tests {
              Sec-WebSocket-Version: 13\r\n\
              Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
              \r\n";
-        let stream = MockStream {
-            read: std::io::Cursor::new(request.as_bytes().to_vec()),
-            written: Vec::new(),
-        };
+        for injected in ["permessage-deflate", "PerMessage-Deflate"] {
+            let stream = MockStream {
+                read: std::io::Cursor::new(request.as_bytes().to_vec()),
+                written: Vec::new(),
+            };
+            let err = crate::accept_hdr_with_config(
+                stream,
+                InjectDeflate(injected),
+                Some(crate::protocol::WebSocketConfig::default().enable_deflate()),
+            )
+            .expect_err("an injected extension header must fail the handshake");
 
-        let err = crate::accept_hdr_with_config(
-            stream,
-            InjectDeflate,
-            Some(crate::protocol::WebSocketConfig::default().enable_deflate()),
-        )
-        .expect_err("an injected extension header must fail the handshake");
-
-        assert!(
-            format!("{err}").contains("Sec-WebSocket-Extensions")
-                || format!("{err:?}").to_lowercase().contains("sec-websocket-extensions"),
-            "must name the header it rejected: {err:?}"
-        );
+            assert!(
+                format!("{err:?}").to_lowercase().contains("sec-websocket-extensions"),
+                "{injected}: must name the header it rejected -- {err:?}"
+            );
+        }
     }
 
     /// Even when compression is disabled locally, a callback cannot advertise
@@ -447,7 +447,7 @@ mod tests {
             written: Vec::new(),
         };
 
-        let err = crate::accept_hdr_with_config(stream, InjectDeflate, None)
+        let err = crate::accept_hdr_with_config(stream, InjectDeflate("permessage-deflate"), None)
             .expect_err("a response cannot advertise a codec the socket did not install");
 
         assert!(matches!(
