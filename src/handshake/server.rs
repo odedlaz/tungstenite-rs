@@ -381,7 +381,7 @@ mod tests {
 
     /// A callback that adds an extension header the client never offered.
     #[cfg(feature = "deflate")]
-    struct InjectDeflate;
+    struct InjectDeflate(&'static str);
 
     #[cfg(feature = "deflate")]
     impl super::Callback for InjectDeflate {
@@ -392,7 +392,7 @@ mod tests {
         ) -> std::result::Result<super::Response, super::ErrorResponse> {
             response.headers_mut().insert(
                 http::header::SEC_WEBSOCKET_EXTENSIONS,
-                http::HeaderValue::from_static("permessage-deflate"),
+                http::HeaderValue::from_static(self.0),
             );
             Ok(response)
         }
@@ -416,23 +416,27 @@ mod tests {
              Sec-WebSocket-Version: 13\r\n\
              Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
              \r\n";
-        let stream = MockStream {
-            read: std::io::Cursor::new(request.as_bytes().to_vec()),
-            written: Vec::new(),
-        };
 
-        let err = crate::accept_hdr_with_config(
-            stream,
-            InjectDeflate,
-            Some(crate::protocol::WebSocketConfig::default().enable_deflate()),
-        )
-        .expect_err("an injected extension header must fail the handshake");
-
-        assert!(
-            format!("{err}").contains("Sec-WebSocket-Extensions")
-                || format!("{err:?}").to_lowercase().contains("sec-websocket-extensions"),
-            "must name the header it rejected: {err:?}"
-        );
+        // Both casings: the parser folds ASCII case on the extension token, so a
+        // mixed-case injection must not slip past a guard that only matched the
+        // canonical spelling. Held fixed at the canonical form, this row could not
+        // have told the difference.
+        for injected in ["permessage-deflate", "PerMessage-Deflate"] {
+            let stream = MockStream {
+                read: std::io::Cursor::new(request.as_bytes().to_vec()),
+                written: Vec::new(),
+            };
+            let err = crate::accept_hdr_with_config(
+                stream,
+                InjectDeflate(injected),
+                Some(crate::protocol::WebSocketConfig::default().enable_deflate()),
+            )
+            .expect_err("an injected extension header must fail the handshake");
+            assert!(
+                format!("{err:?}").to_lowercase().contains("sec-websocket-extensions"),
+                "{injected}: must name the header it rejected -- {err:?}"
+            );
+        }
     }
 
     /// The same injection with **no deflate configured at all**.
@@ -458,7 +462,7 @@ mod tests {
             written: Vec::new(),
         };
 
-        crate::accept_hdr_with_config(stream, InjectDeflate, None)
+        crate::accept_hdr_with_config(stream, InjectDeflate("permessage-deflate"), None)
             .expect_err("an injected header must fail even with deflate unconfigured");
     }
 
