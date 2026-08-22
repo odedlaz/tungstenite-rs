@@ -417,4 +417,38 @@ mod tests {
         let req = request_with_key("dGhlIHNhbXBsZSBub25jZQ==");
         assert!(create_response(&req).is_ok());
     }
+
+    #[cfg(feature = "deflate")]
+    #[test]
+    fn server_selects_first_acceptable_deflate_offer() {
+        use crate::protocol::{Role, WebSocketConfig};
+
+        let offers = [
+            "permessage-deflate".parse().unwrap(),
+            "permessage-deflate; server_max_window_bits=12".parse().unwrap(),
+            "permessage-deflate; client_max_window_bits=11; future=3".parse().unwrap(),
+            "permessage-deflate; client_no_context_takeover; client_max_window_bits=11"
+                .parse()
+                .unwrap(),
+            "permessage-deflate; client_max_window_bits=10".parse().unwrap(),
+        ];
+        let (config, response) = WebSocketConfig::default()
+            .enable_deflate()
+            .deflate_max_window_bits(Role::Client, 11)
+            .accept_deflate_offers(&offers);
+        assert_eq!(
+            response.unwrap(),
+            "permessage-deflate; client_no_context_takeover; client_max_window_bits=11"
+        );
+        let agreed = config.deflate.unwrap();
+        assert!(agreed.client_no_context_takeover);
+        assert_eq!(agreed.client_max_window_bits, 11);
+
+        let split =
+            ["x-example; value=\"a,b;c\"".parse().unwrap(), "permessage-deflate".parse().unwrap()];
+        let (config, response) =
+            WebSocketConfig::default().enable_deflate().accept_deflate_offers(&split);
+        assert_eq!(response.unwrap(), "permessage-deflate");
+        assert!(config.deflate.is_some());
+    }
 }
