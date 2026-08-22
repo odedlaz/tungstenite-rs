@@ -269,14 +269,23 @@ impl<S: Read + Write, C: Callback> HandshakeRole for ServerHandshake<S, C> {
                     Ok(response) => {
                         #[cfg(feature = "deflate")]
                         let mut response = response;
+                        // Unconditional under the feature: a callback-owned
+                        // extension header is rejected whether or not this server
+                        // configured deflate. Nested under the config gate it let a
+                        // config-off server answer `101` with
+                        // `Sec-WebSocket-Extensions: permessage-deflate` over a
+                        // socket that has no codec -- the peer is then entitled to
+                        // send RSV1 and the connection breaks on the first such
+                        // frame. Failing later is not a substitute for refusing a
+                        // response that claims state the runtime never installed.
+                        #[cfg(feature = "deflate")]
+                        if crate::protocol::deflate::headers_select_deflate(response.headers()) {
+                            return Err(Error::Protocol(ProtocolError::InvalidHeader(
+                                http::header::SEC_WEBSOCKET_EXTENSIONS.clone().into(),
+                            )));
+                        }
                         #[cfg(feature = "deflate")]
                         if self.config.as_ref().is_some_and(|config| config.deflate.is_some()) {
-                            if crate::protocol::deflate::headers_select_deflate(response.headers())
-                            {
-                                return Err(Error::Protocol(ProtocolError::InvalidHeader(
-                                    http::header::SEC_WEBSOCKET_EXTENSIONS.clone().into(),
-                                )));
-                            }
                             let offers = result
                                 .headers()
                                 .get_all(http::header::SEC_WEBSOCKET_EXTENSIONS)
@@ -424,6 +433,33 @@ mod tests {
                 || format!("{err:?}").to_lowercase().contains("sec-websocket-extensions"),
             "must name the header it rejected: {err:?}"
         );
+    }
+
+    /// The same injection with **no deflate configured at all**.
+    ///
+    /// This is the case my first row missed: it enabled deflate, so the guard was
+    /// reached and the row proved the guard works *when it runs* rather than that
+    /// it always runs. Nested under `config.deflate.is_some()` it did not run, and
+    /// a config-off server answered `101` advertising compression over a socket
+    /// with no codec.
+    #[cfg(feature = "deflate")]
+    #[test]
+    fn a_callback_injection_is_rejected_even_with_no_deflate_configured() {
+        let request = "GET /script.ws HTTP/1.1\r\n\
+             Host: foo.com\r\n\
+             Connection: upgrade\r\n\
+             Upgrade: websocket\r\n\
+             Sec-WebSocket-Version: 13\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+             Sec-WebSocket-Extensions: permessage-deflate\r\n\
+             \r\n";
+        let stream = MockStream {
+            read: std::io::Cursor::new(request.as_bytes().to_vec()),
+            written: Vec::new(),
+        };
+
+        crate::accept_hdr_with_config(stream, InjectDeflate, None)
+            .expect_err("an injected header must fail even with deflate unconfigured");
     }
 
     /// The control: the identical callback and config, injecting nothing, must
