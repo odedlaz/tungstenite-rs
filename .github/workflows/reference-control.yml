@@ -1,0 +1,62 @@
+# SCRATCH BRANCH ONLY. Not for upstream.
+#
+# One variable, five peers: the same digest-pinned Autobahn tester runs the same
+# 517-case spec against our deflate server, our deflate-free server, and three
+# implementations that are not ours. If the tester's memory runs away against
+# every conforming peer, the abort is Autobahn's; if it only runs away against
+# ours, we have a codec bug and no amount of CI sharding should hide it.
+name: Autobahn tester-memory control
+
+on:
+  push:
+    branches: [bob/autobahn-reference-control]
+  workflow_dispatch:
+
+jobs:
+  control:
+    name: ${{ matrix.testee }} attempt ${{ matrix.attempt }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    strategy:
+      # Under the same 6 GiB cap the diagnostic branch saw 16 of 18 arms finish,
+      # so a single quiet arm is not evidence of anything. Repeat every peer.
+      fail-fast: false
+      matrix:
+        testee:
+          - tungstenite
+          - tungstenite-plain
+          - node-ws
+          - python-websockets
+          - autobahn-testee
+        attempt: [1, 2, 3]
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Install toolchain
+        if: startsWith(matrix.testee, 'tungstenite')
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+
+      - name: Run the control arm
+        env:
+          TESTEE: ${{ matrix.testee }}
+        run: ./scripts/reference-control.sh
+
+      - name: Publish the arm's summary
+        if: always()
+        run: cat autobahn/control-out/summary.md >> "${GITHUB_STEP_SUMMARY}" || true
+
+      - name: Preserve the arm's raw evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: control-${{ matrix.testee }}-${{ matrix.attempt }}
+          path: |
+            autobahn/control-out/
+            autobahn/server/
+          if-no-files-found: warn
+          retention-days: 7

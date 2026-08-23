@@ -112,6 +112,10 @@ name = "autobahn-server"
 required-features = ["handshake", "deflate"]
 
 [[example]]
+name = "autobahn-server-plain"
+required-features = ["handshake"]
+
+[[example]]
 name = "callback-error"
 required-features = ["handshake"]
 

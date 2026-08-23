@@ -3,3 +3,5 @@ Cargo.lock
 .vscode
 autobahn/client/
 autobahn/server/
+autobahn/control-out/
+autobahn/fuzzingclient-control.json
