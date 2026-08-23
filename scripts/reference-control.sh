@@ -179,7 +179,11 @@ for line in sys.stdin:
     sys.stdout.write("%.3f %s" % (time.time(), line))' >> "${CASELOG}" &
 LOGGER_PID=$!
 
-if CLIENT_STATUS=$(timeout "${RUN_TIMEOUT}" docker wait "${CONTAINER}"); then
+# `timeout` is GNU-only. Without it the CI job's own ceiling is the backstop; the
+# point of keeping this runnable off a Linux runner is that local reproduction is
+# the fast loop, and a missing binary should not silently report a timeout.
+TIMEOUT_BIN=$(command -v timeout || command -v gtimeout || true)
+if CLIENT_STATUS=$(${TIMEOUT_BIN:+"${TIMEOUT_BIN}" "${RUN_TIMEOUT}"} docker wait "${CONTAINER}"); then
     :
 else
     CLIENT_STATUS=timeout
@@ -197,7 +201,7 @@ docker inspect "${CONTAINER}" --format \
     > "${OUTDIR}/container-state.txt" 2>&1
 cp autobahn/server/index.json "${OUTDIR}/index.json" 2>/dev/null
 { set +x
-  sudo dmesg 2>/dev/null | grep -iE 'out of memory|oom-kill|killed process' | tail -20 \
+  sudo -n dmesg 2>/dev/null | grep -iE 'out of memory|oom-kill|killed process' | tail -20 \
       > "${OUTDIR}/dmesg-oom.txt" || echo 'dmesg unavailable' > "${OUTDIR}/dmesg-oom.txt"
   tail -50 "${TESTEE_LOG}" > "${OUTDIR}/testee-tail.log" 2>/dev/null
 }
