@@ -1,0 +1,106 @@
+name: Aggregator equivalence
+
+on: [push, workflow_dispatch]
+
+jobs:
+  equivalence:
+    name: Sharded aggregate against the stock monolith
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+
+      # The stock arm resolves a mutable tag. Asserting what it resolves to keeps
+      # that arm byte-identical to the script whose output is the reference, while
+      # still establishing that both arms measured through one tester build.
+      - name: Assert one tester build across both arms
+        shell: bash
+        run: |
+          set -euo pipefail
+          digest=sha256:519915fb568b04c9383f70a1c405ae3ff44ab9e35835b085239c258b6fac3074
+          docker pull -q crossbario/autobahn-testsuite
+          resolved=$(docker inspect crossbario/autobahn-testsuite --format '{{join .RepoDigests ","}}')
+          echo "tag resolves to ${resolved}"
+          case "${resolved}" in
+            *"${digest}"*) echo "matches the pinned digest" ;;
+            *) echo "the tag no longer resolves to the pinned digest; the arms would not share an instrument"
+               exit 65 ;;
+          esac
+
+      - name: Arm A, sharded aggregate
+        run: ./scripts/autobahn-server-sharded.sh
+
+      # Arm A's own oracle diff has already run by here. Move its output before
+      # arm B overwrites the same path, and upload it before arm B gets a chance
+      # to take the runner down with it.
+      - name: Retain arm A
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p equivalence
+          cp -r autobahn/server equivalence/arm-a-sharded
+          rm -rf autobahn/server
+
+      - name: Upload arm A
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: arm-a-sharded
+          path: equivalence/arm-a-sharded
+
+      # Recorded rather than gating. This is the arm the tester's own memory
+      # growth has killed, and losing it must not lose arm A.
+      - name: Arm B, stock monolith
+        shell: bash
+        run: |
+          set -uo pipefail
+          status=0
+          ./scripts/autobahn-server.sh || status=$?
+          echo "monolith_status=${status}" >> "${GITHUB_ENV}"
+          echo "stock monolith exited ${status}"
+
+      - name: Upload arm B
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: arm-b-monolith
+          path: autobahn/server
+
+      - name: Compare the arms
+        shell: bash
+        run: |
+          set -euo pipefail
+          sharded=equivalence/arm-a-sharded/index.json
+          stock=autobahn/server/index.json
+
+          if [ "${monolith_status}" != "0" ]; then
+            echo "stock monolith exited ${monolith_status}, so there is no matched"
+            echo "comparison this run. Arm A stands on its own oracle diff; re-run for a pair."
+            exit 75
+          fi
+
+          # Redirected to files rather than compared through `<(jq …)`: process
+          # substitution discards jq's status, and two empty streams compare equal.
+          for index in "${sharded}" "${stock}"; do
+            if ! jq -e -c '.Tungstenite | keys' "${index}" > /dev/null; then
+              echo "${index}: missing, empty, or not valid Autobahn output"
+              exit 65
+            fi
+          done
+          jq -S 'del(."Tungstenite" | .. | .duration?)' "${sharded}" > /tmp/arm-a.json
+          jq -S 'del(."Tungstenite" | .. | .duration?)' "${stock}" > /tmp/arm-b.json
+
+          if ! diff -u /tmp/arm-b.json /tmp/arm-a.json; then
+            echo "the sharded aggregate does not reproduce the stock index"
+            exit 64
+          fi
+          echo "arms identical after duration normalisation:" \
+               "$(jq '.Tungstenite | length' "${sharded}") cases"
