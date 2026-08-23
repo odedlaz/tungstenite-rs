@@ -10,8 +10,19 @@ cd "${SOURCE_DIR}/.."
 # build. The mutable tag would let the instrument change between them.
 IMAGE=crossbario/autobahn-testsuite@sha256:519915fb568b04c9383f70a1c405ae3ff44ab9e35835b085239c258b6fac3074
 CONTAINER_NAME=fuzzingserver
+
+# Stop only the container this invocation created. Stopping by name would end
+# whatever holds the name, and the case where the name is already held is
+# exactly the case where it is not ours.
+#
+# `|| true` because errexit stays in force inside an EXIT trap: a stop that fails
+# would abort the trap and exit 1, discarding the 64 or 65 that says whether this
+# run disagreed with the oracle or never finished.
 function cleanup() {
-    docker container stop "${CONTAINER_NAME}"
+    if [ -n "${CONTAINER_ID:-}" ]; then
+        docker container stop "${CONTAINER_ID}" >/dev/null 2>&1 || true
+    fi
+    return 0
 }
 trap cleanup TERM EXIT
 
@@ -45,14 +56,22 @@ function test_diff() {
     fi
 }
 
-docker run -d --rm \
+# No `--rm`: a container that died is the only record of why, and the run that
+# needs that record is the one that cannot ask for it afterwards.
+CONTAINER_ID=$(docker run -d \
     -v "${PWD}/autobahn:/autobahn" \
     -p 9001:9001 \
     --init \
     --name "${CONTAINER_NAME}" \
     "${IMAGE}" \
-    wstest -m fuzzingserver -s 'autobahn/fuzzingserver.json'
+    wstest -m fuzzingserver -s 'autobahn/fuzzingserver.json')
 
 sleep 3
 cargo run --release --example autobahn-client --features=deflate
 test_diff
+
+# Past the diff nothing is left to learn from the tester, and the server role
+# that runs next requires this name to be free.
+docker container stop "${CONTAINER_ID}" >/dev/null
+docker container rm "${CONTAINER_ID}" >/dev/null
+CONTAINER_ID=
