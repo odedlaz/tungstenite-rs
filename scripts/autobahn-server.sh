@@ -20,10 +20,6 @@ SHARD_TIMEOUT=${SHARD_TIMEOUT:-600}
 # Far above the ~1 GiB a nine-case shard is sized for and below the 6 GiB that has
 # killed a monolithic run: a runaway fails its own shard instead of the host.
 SHARD_MEMORY=${SHARD_MEMORY:-4g}
-# Kernel ownership is the lock; the pathname is not. Held for the whole run so two
-# Autobahn runs on one host cannot each believe they own ports 9001 and 9002.
-LOCK=${AUTOBAHN_LOCK:-/tmp/tungstenite-autobahn.lock}
-
 function cleanup() {
     # Only ever our own children. A container left behind by a failed shard is
     # evidence, and anything else on this host belongs to someone else.
@@ -40,21 +36,6 @@ function require_tools() {
         echo "${tool} is required: the port-ownership and index checks below are not optional"
         exit 69
     done
-}
-
-function acquire_lease() {
-    exec 9>"${LOCK}"
-    if [ -n "${AUTOBAHN_LOCK_HELD:-}" ]; then
-        return 0  # an outer holder of this same lock invoked us
-    fi
-    if ! command -v flock >/dev/null 2>&1; then
-        echo "no flock(1): re-run under a holder of ${LOCK} with AUTOBAHN_LOCK_HELD=1"
-        exit 75
-    fi
-    if ! flock -n 9; then
-        echo "another Autobahn run holds ${LOCK}"
-        exit 75
-    fi
 }
 
 function listener_pids() {
@@ -247,7 +228,6 @@ function aggregate() {
 }
 
 require_tools
-acquire_lease
 preflight
 provenance start
 verify_manifest
