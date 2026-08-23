@@ -20,11 +20,17 @@ SHARD_TIMEOUT=${SHARD_TIMEOUT:-600}
 # Far above the ~1 GiB a nine-case shard is sized for and below the 6 GiB that has
 # killed a monolithic run: a runaway fails its own shard instead of the host.
 SHARD_MEMORY=${SHARD_MEMORY:-4g}
+# Only ever our own children. A container left behind by a failed shard is
+# evidence, and anything else on this host belongs to someone else.
+#
+# `|| true` is load-bearing rather than defensive: errexit stays in force inside
+# an EXIT trap, so signalling an already-reaped PID aborts the trap and the shell
+# exits 1. That replaces the code naming the failure -- 70 for an ownership
+# change, 65 for an incomplete arm, 64 for an oracle mismatch -- with a bare 1,
+# and the server-is-gone path is exactly the path whose PID is already reaped.
 function cleanup() {
-    # Only ever our own children. A container left behind by a failed shard is
-    # evidence, and anything else on this host belongs to someone else.
-    [ -n "${WSSERVER_PID:-}" ] && kill "${WSSERVER_PID}" 2>/dev/null
-    [ -n "${WATCHDOG_PID:-}" ] && kill "${WATCHDOG_PID}" 2>/dev/null
+    if [ -n "${WSSERVER_PID:-}" ]; then kill "${WSSERVER_PID}" 2>/dev/null || true; fi
+    if [ -n "${WATCHDOG_PID:-}" ]; then kill "${WATCHDOG_PID}" 2>/dev/null || true; fi
     return 0
 }
 trap cleanup TERM EXIT
