@@ -7,9 +7,10 @@
 # ours, we have a codec bug and no amount of CI sharding should hide it.
 name: Autobahn tester-memory control
 
+# Dispatch only. The experiment this was built for is answered at `864320d6`;
+# leaving a push trigger on the branch spends fifteen arms re-answering it every
+# time a fix lands.
 on:
-  push:
-    branches: [bob/autobahn-reference-control]
   workflow_dispatch:
 
 jobs:
