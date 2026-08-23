@@ -23,6 +23,7 @@ SHARD_MEMORY=${SHARD_MEMORY:-4g}
 # The example server installs no signal handler, so TERM ends it; this bounds the
 # case where that stops being true.
 SHUTDOWN_GRACE=${SHUTDOWN_GRACE:-10}
+
 # Only ever our own children. A container left behind by a failed shard is
 # evidence, and anything else on this host belongs to someone else.
 #
