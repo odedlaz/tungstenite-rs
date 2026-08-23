@@ -6,18 +6,6 @@ use tungstenite::{
 
 const AGENT: &str = "Tungstenite";
 
-// Two definitions because `cargo hack check --feature-powerset --all-targets`
-// builds this example in cells without `deflate`. `None` is what `connect` passes.
-#[cfg(feature = "deflate")]
-fn suite_config() -> Option<WebSocketConfig> {
-    Some(WebSocketConfig::default().enable_deflate())
-}
-
-#[cfg(not(feature = "deflate"))]
-fn suite_config() -> Option<WebSocketConfig> {
-    None
-}
-
 fn get_case_count() -> Result<u32> {
     let (mut socket, _) = connect("ws://localhost:9001/getCaseCount")?;
     let msg = socket.read()?;
@@ -34,7 +22,8 @@ fn update_reports() -> Result<()> {
 fn run_test(case: u32) -> Result<()> {
     info!("Running test case {case}");
     let case_url = format!("ws://localhost:9001/runCase?case={case}&agent={AGENT}");
-    let (mut socket, _) = connect_with_config(case_url, suite_config(), 3)?;
+    let (mut socket, _) =
+        connect_with_config(case_url, Some(WebSocketConfig::default().enable_deflate()), 3)?;
     loop {
         match socket.read()? {
             msg @ Message::Text(_) | msg @ Message::Binary(_) => {

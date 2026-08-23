@@ -9,19 +9,6 @@ use tungstenite::{
     Message, Result,
 };
 
-// Two definitions because `cargo hack check --feature-powerset --all-targets`
-// builds this example in cells without `deflate`. Enabling is all the server
-// owes: the accept path answers the client's offers itself.
-#[cfg(feature = "deflate")]
-fn suite_config() -> Option<WebSocketConfig> {
-    Some(WebSocketConfig::default().enable_deflate())
-}
-
-#[cfg(not(feature = "deflate"))]
-fn suite_config() -> Option<WebSocketConfig> {
-    None
-}
-
 fn must_not_block<Role: HandshakeRole>(err: HandshakeError<Role>) -> Error {
     match err {
         HandshakeError::Interrupted(_) => panic!("Bug: blocking socket would block"),
@@ -30,7 +17,9 @@ fn must_not_block<Role: HandshakeRole>(err: HandshakeError<Role>) -> Error {
 }
 
 fn handle_client(stream: TcpStream) -> Result<()> {
-    let mut socket = accept_with_config(stream, suite_config()).map_err(must_not_block)?;
+    // Enabling is all the server owes: the accept path answers the client's offers.
+    let mut socket = accept_with_config(stream, Some(WebSocketConfig::default().enable_deflate()))
+        .map_err(must_not_block)?;
     info!("Running test");
     loop {
         match socket.read()? {
