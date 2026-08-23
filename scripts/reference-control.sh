@@ -16,7 +16,7 @@ set -uo pipefail
 SOURCE_DIR=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")
 cd "${SOURCE_DIR}/.." || exit 1
 
-TESTEE=${TESTEE:?set TESTEE to tungstenite|tungstenite-plain|node-ws|python-websockets|autobahn-testee}
+TESTEE=${TESTEE:?set TESTEE to tungstenite|tungstenite-win9|tungstenite-plain|node-ws|python-websockets|autobahn-testee}
 CLIENT_MEMORY=${CLIENT_MEMORY:-6g}
 RUN_TIMEOUT=${RUN_TIMEOUT:-1500}
 SAMPLE_INTERVAL=${SAMPLE_INTERVAL:-1}
@@ -33,6 +33,7 @@ TESTEE_LOG=${OUTDIR}/testee.log
 
 case "${TESTEE}" in
     tungstenite)       AGENT=Tungstenite ;;
+    tungstenite-win9)  AGENT=TungsteniteWin9 ;;
     tungstenite-plain) AGENT=TungstenitePlain ;;
     node-ws)           AGENT=NodeWs ;;
     python-websockets) AGENT=PythonWebsockets ;;
@@ -63,6 +64,10 @@ case "${TESTEE}" in
     tungstenite)
         cargo build --release --example autobahn-server --features=deflate || exit 70
         ./target/release/examples/autobahn-server >"${TESTEE_LOG}" 2>&1 & TESTEE_PID=$!
+        ;;
+    tungstenite-win9)
+        cargo build --release --example autobahn-server-win9 --features=deflate || exit 70
+        ./target/release/examples/autobahn-server-win9 >"${TESTEE_LOG}" 2>&1 & TESTEE_PID=$!
         ;;
     tungstenite-plain)
         cargo build --release --example autobahn-server-plain || exit 70

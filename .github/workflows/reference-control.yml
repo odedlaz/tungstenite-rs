@@ -12,6 +12,13 @@ name: Autobahn tester-memory control
 # time a fix lands.
 on:
   workflow_dispatch:
+    inputs:
+      peers:
+        description: JSON array of peers to run
+        default: '["tungstenite","tungstenite-win9","tungstenite-plain","node-ws","python-websockets","autobahn-testee"]'
+      attempts:
+        description: JSON array of attempt numbers
+        default: '[1,2,3]'
 
 jobs:
   control:
@@ -24,13 +31,8 @@ jobs:
       # so a single quiet arm is not evidence of anything. Repeat every peer.
       fail-fast: false
       matrix:
-        testee:
-          - tungstenite
-          - tungstenite-plain
-          - node-ws
-          - python-websockets
-          - autobahn-testee
-        attempt: [1, 2, 3]
+        testee: ${{ fromJSON(inputs.peers) }}
+        attempt: ${{ fromJSON(inputs.attempts) }}
 
     steps:
       - name: Checkout sources
