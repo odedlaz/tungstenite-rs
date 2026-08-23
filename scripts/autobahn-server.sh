@@ -29,9 +29,8 @@ SHUTDOWN_GRACE=${SHUTDOWN_GRACE:-10}
 #
 # `|| true` is load-bearing rather than defensive: errexit stays in force inside
 # an EXIT trap, so signalling an already-reaped PID aborts the trap and the shell
-# exits 1. That replaces the code naming the failure -- 70 for an ownership
-# change, 65 for an incomplete arm, 64 for an oracle mismatch -- with a bare 1,
-# and the server-is-gone path is exactly the path whose PID is already reaped.
+# exits 1, discarding the code that named the failure. The server-is-gone path is
+# exactly the path whose PID is already reaped.
 function cleanup() {
     if [ -n "${WSSERVER_PID:-}" ]; then kill "${WSSERVER_PID}" 2>/dev/null || true; fi
     if [ -n "${WATCHDOG_PID:-}" ]; then kill "${WATCHDOG_PID}" 2>/dev/null || true; fi
@@ -179,9 +178,8 @@ function verify_server() {
     fi
 }
 
-# Everything above proves the server was ours while it mattered. This proves the
-# host is clean afterwards, which is the next run's preflight and not something a
-# TERM we never waited on can establish.
+# A signal is not an exit, so the trap cannot establish this: the host being clean
+# afterwards is the next run's preflight, and it is this run's job to leave it so.
 function shutdown_server() {
     local pids
     kill "${WSSERVER_PID}" 2>/dev/null || true

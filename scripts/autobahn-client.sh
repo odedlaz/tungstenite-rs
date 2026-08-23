@@ -11,13 +11,10 @@ cd "${SOURCE_DIR}/.."
 IMAGE=crossbario/autobahn-testsuite@sha256:519915fb568b04c9383f70a1c405ae3ff44ab9e35835b085239c258b6fac3074
 CONTAINER_NAME=fuzzingserver
 
-# Stop only the container this invocation created. Stopping by name would end
-# whatever holds the name, and the case where the name is already held is
-# exactly the case where it is not ours.
-#
-# `|| true` because errexit stays in force inside an EXIT trap: a stop that fails
-# would abort the trap and exit 1, discarding the 64 or 65 that says whether this
-# run disagreed with the oracle or never finished.
+# Stop only the container this invocation created: the case where the name is
+# already held is exactly the case where it is not ours. `|| true` because
+# errexit stays in force inside an EXIT trap, and a stop that fails there would
+# discard the code that named the failure.
 function cleanup() {
     if [ -n "${CONTAINER_ID:-}" ]; then
         docker container stop "${CONTAINER_ID}" >/dev/null 2>&1 || true
