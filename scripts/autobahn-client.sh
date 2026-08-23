@@ -6,6 +6,9 @@ SOURCE_DIR=$(readlink -f "${BASH_SOURCE[0]}")
 SOURCE_DIR=$(dirname "$SOURCE_DIR")
 cd "${SOURCE_DIR}/.."
 
+# Both roles compare against one oracle, so both must read it through one tester
+# build. The mutable tag would let the instrument change between them.
+IMAGE=crossbario/autobahn-testsuite@sha256:519915fb568b04c9383f70a1c405ae3ff44ab9e35835b085239c258b6fac3074
 CONTAINER_NAME=fuzzingserver
 function cleanup() {
     docker container stop "${CONTAINER_NAME}"
@@ -47,7 +50,7 @@ docker run -d --rm \
     -p 9001:9001 \
     --init \
     --name "${CONTAINER_NAME}" \
-    crossbario/autobahn-testsuite \
+    "${IMAGE}" \
     wstest -m fuzzingserver -s 'autobahn/fuzzingserver.json'
 
 sleep 3
