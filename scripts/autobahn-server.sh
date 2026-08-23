@@ -43,9 +43,11 @@ function listener_pids() {
 }
 
 # Refuse a dirty host rather than reclaiming it: whatever is holding these ports,
-# containers or directories belongs to a run we cannot see.
+# containers or directories belongs to a run we cannot see. Only this role's own
+# output directory, though -- autobahn/client is where the client role that ran
+# before us in the same job left the evidence of its pass.
 function preflight() {
-    local stray port pids dir
+    local stray port pids
     stray=$(docker ps -a --format '{{.Names}}' | grep -E '^fuzzing(server|client)' || true)
     if [ -n "${stray}" ]; then
         echo "preflight: Autobahn containers present: ${stray}"
@@ -63,12 +65,10 @@ function preflight() {
         echo "preflight: Autobahn processes running: PID(s) ${stray}"
         exit 75
     fi
-    for dir in autobahn/client "${OUTDIR}"; do
-        if [ -n "$(ls -A "${dir}" 2>/dev/null)" ]; then
-            echo "preflight: ${dir} is not empty; move it aside instead of overwriting it"
-            exit 75
-        fi
-    done
+    if [ -n "$(ls -A "${OUTDIR}" 2>/dev/null)" ]; then
+        echo "preflight: ${OUTDIR} is not empty; move it aside instead of overwriting it"
+        exit 75
+    fi
 }
 
 function provenance() {
