@@ -105,3 +105,17 @@ jobs:
 
       - name: Running Autobahn TestSuite for server
         run: ./scripts/autobahn-server.sh
+
+      # wstest writes index.json and the per-case reports into the mounted
+      # volume as it runs, so an arm that fails test_diff still leaves behind
+      # the results the oracle has to be regenerated from.
+      - name: Preserve the Autobahn reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: autobahn-reports-${{ matrix.rust }}
+          path: |
+            autobahn/client/
+            autobahn/server/
+          if-no-files-found: warn
+          retention-days: 7
