@@ -51,6 +51,10 @@ function cleanup() {
 trap cleanup TERM EXIT
 
 set -x
+# Truncate, do not append. A second arm run in the same tree inherited the first
+# arm's case log, and since the summary places a memory crossing by the last case
+# logged at or before it, that silently attributes one peer's cases to another.
+rm -rf "${OUTDIR}"
 mkdir -p "${OUTDIR}" autobahn/server
 rm -f autobahn/server/*.json
 
