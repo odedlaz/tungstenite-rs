@@ -11,7 +11,26 @@ function cleanup() {
 }
 trap cleanup TERM EXIT
 
+# `diff <(jq …) <(jq …)` cannot fail closed by itself: process substitution
+# discards jq's exit status, so a missing or malformed index reaches `diff` as an
+# empty stream, and two empty streams compare equal. An aborted suite is exactly
+# that case — it leaves behind a partial index, or none at all.
+function check_index() {
+    local index=$1 produced expected
+    if ! produced=$(jq -e -S '.Tungstenite | keys' "${index}"); then
+        echo "${index}: missing, empty, or not valid Autobahn output"
+        exit 65
+    fi
+    expected=$(jq -e -S '.Tungstenite | keys' 'autobahn/expected-results.json')
+    if [ "${produced}" != "${expected}" ]; then
+        echo "${index}: produced $(jq length <<<"${produced}") cases against the" \
+             "oracle's $(jq length <<<"${expected}"); a partial run must not be diffed."
+        exit 65
+    fi
+}
+
 function test_diff() {
+    check_index 'autobahn/server/index.json'
     if ! diff -q \
         <(jq -S 'del(."Tungstenite" | .. | .duration?)' 'autobahn/expected-results.json') \
         <(jq -S 'del(."Tungstenite" | .. | .duration?)' 'autobahn/server/index.json')
