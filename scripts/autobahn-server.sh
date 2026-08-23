@@ -6,34 +6,151 @@ SOURCE_DIR=$(readlink -f "${BASH_SOURCE[0]}")
 SOURCE_DIR=$(dirname "$SOURCE_DIR")
 cd "${SOURCE_DIR}/.."
 
+# Digest-pinned: the tester's own memory growth is what this harness contains, so
+# the tester must not change underneath it.
+IMAGE=crossbario/autobahn-testsuite@sha256:519915fb568b04c9383f70a1c405ae3ff44ab9e35835b085239c258b6fac3074
+ORACLE=autobahn/expected-results.json
+MANIFEST=autobahn/server-shards.txt
+OUTDIR=autobahn/server
+SERVER=target/release/examples/autobahn-server
+PORT=9002
+# A hung shard costs this instead of the job's six-hour default. The watchdog
+# signals the docker client only, so the container stays inspectable afterwards.
+SHARD_TIMEOUT=${SHARD_TIMEOUT:-600}
+# Far above the ~1 GiB a nine-case shard is sized for and below the 6 GiB that has
+# killed a monolithic run: a runaway fails its own shard instead of the host.
+SHARD_MEMORY=${SHARD_MEMORY:-4g}
+# Kernel ownership is the lock; the pathname is not. Held for the whole run so two
+# Autobahn runs on one host cannot each believe they own ports 9001 and 9002.
+LOCK=${AUTOBAHN_LOCK:-/tmp/tungstenite-autobahn.lock}
+
 function cleanup() {
-    kill -9 ${WSSERVER_PID}
+    # Only ever our own children. A container left behind by a failed shard is
+    # evidence, and anything else on this host belongs to someone else.
+    [ -n "${WSSERVER_PID:-}" ] && kill "${WSSERVER_PID}" 2>/dev/null
+    [ -n "${WATCHDOG_PID:-}" ] && kill "${WATCHDOG_PID}" 2>/dev/null
+    return 0
 }
 trap cleanup TERM EXIT
+
+function require_tools() {
+    local tool
+    for tool in docker jq lsof pgrep; do
+        command -v "${tool}" >/dev/null 2>&1 && continue
+        echo "${tool} is required: the port-ownership and index checks below are not optional"
+        exit 69
+    done
+}
+
+function acquire_lease() {
+    exec 9>"${LOCK}"
+    if [ -n "${AUTOBAHN_LOCK_HELD:-}" ]; then
+        return 0  # an outer holder of this same lock invoked us
+    fi
+    if ! command -v flock >/dev/null 2>&1; then
+        echo "no flock(1): re-run under a holder of ${LOCK} with AUTOBAHN_LOCK_HELD=1"
+        exit 75
+    fi
+    if ! flock -n 9; then
+        echo "another Autobahn run holds ${LOCK}"
+        exit 75
+    fi
+}
+
+function listener_pids() {
+    lsof -nP -iTCP:"$1" -sTCP:LISTEN -t 2>/dev/null || true
+}
+
+# Refuse a dirty host rather than reclaiming it: whatever is holding these ports,
+# containers or directories belongs to a run we cannot see.
+function preflight() {
+    local stray port pids dir
+    stray=$(docker ps -a --format '{{.Names}}' | grep -E '^fuzzing(server|client)' || true)
+    if [ -n "${stray}" ]; then
+        echo "preflight: Autobahn containers present: ${stray}"
+        exit 75
+    fi
+    for port in 9001 "${PORT}"; do
+        pids=$(listener_pids "${port}")
+        if [ -n "${pids}" ]; then
+            echo "preflight: port ${port} is bound by PID(s) ${pids}"
+            exit 75
+        fi
+    done
+    stray=$(pgrep -f 'examples/autobahn-(client|server)|wstest -m fuzzing' || true)
+    if [ -n "${stray}" ]; then
+        echo "preflight: Autobahn processes running: PID(s) ${stray}"
+        exit 75
+    fi
+    for dir in autobahn/client "${OUTDIR}"; do
+        if [ -n "$(ls -A "${dir}" 2>/dev/null)" ]; then
+            echo "preflight: ${dir} is not empty; move it aside instead of overwriting it"
+            exit 75
+        fi
+    done
+}
+
+function provenance() {
+    echo "=== provenance: $1 ==="
+    rustc --version
+    if command -v git >/dev/null 2>&1 && git rev-parse --git-dir >/dev/null 2>&1; then
+        git rev-parse HEAD
+        git status --porcelain
+        git hash-object scripts/autobahn-server.sh "${MANIFEST}" "${ORACLE}"
+    fi
+}
+
+function shard_ids() {
+    awk '$1 !~ /^#/ && $1 != previous { print $1; previous = $1 }' "${MANIFEST}"
+}
+
+function shard_cases() {
+    awk -v shard="$1" '$1 == shard { print $2 }' "${MANIFEST}"
+}
+
+function case_array() {
+    jq -R -s -c 'split("\n") | map(select(length > 0)) | sort'
+}
+
+# The manifest is the pre-registered partition, so it -- not the run -- decides
+# what gets tested. Drift against the oracle would silently shrink the population.
+function verify_manifest() {
+    local declared expected ids
+    declared=$(awk '$1 !~ /^#/ { print $2 }' "${MANIFEST}" | case_array)
+    expected=$(jq -c '.Tungstenite | keys' "${ORACLE}")
+    if [ "${declared}" != "${expected}" ]; then
+        echo "${MANIFEST}: declared cases differ from ${ORACLE}; the shards no longer partition the suite"
+        exit 65
+    fi
+    ids=$(shard_ids)
+    if [ "$(wc -l <<<"${ids}")" != "$(sort -u <<<"${ids}" | wc -l)" ]; then
+        echo "${MANIFEST}: a shard's cases are not contiguous, so it would run twice"
+        exit 65
+    fi
+}
 
 # `diff <(jq …) <(jq …)` cannot fail closed by itself: process substitution
 # discards jq's exit status, so a missing or malformed index reaches `diff` as an
 # empty stream, and two empty streams compare equal. An aborted suite is exactly
-# that case — it leaves behind a partial index, or none at all.
-function check_index() {
-    local index=$1 produced expected
-    if ! produced=$(jq -e -S '.Tungstenite | keys' "${index}"); then
+# that case -- it leaves behind a partial index, or none at all.
+function check_cases() {
+    local index=$1 expected=$2 produced
+    if ! produced=$(jq -e -c '.Tungstenite | keys' "${index}"); then
         echo "${index}: missing, empty, or not valid Autobahn output"
         exit 65
     fi
-    expected=$(jq -e -S '.Tungstenite | keys' 'autobahn/expected-results.json')
     if [ "${produced}" != "${expected}" ]; then
-        echo "${index}: produced $(jq length <<<"${produced}") cases against the" \
-             "oracle's $(jq length <<<"${expected}"); a partial run must not be diffed."
+        echo "${index}: produced $(jq length <<<"${produced}") cases against the expected" \
+             "$(jq length <<<"${expected}"); a partial run must not be diffed."
         exit 65
     fi
 }
 
 function test_diff() {
-    check_index 'autobahn/server/index.json'
+    check_cases "${OUTDIR}/index.json" "$(jq -c '.Tungstenite | keys' "${ORACLE}")"
     if ! diff -q \
-        <(jq -S 'del(."Tungstenite" | .. | .duration?)' 'autobahn/expected-results.json') \
-        <(jq -S 'del(."Tungstenite" | .. | .duration?)' 'autobahn/server/index.json')
+        <(jq -S 'del(."Tungstenite" | .. | .duration?)' "${ORACLE}") \
+        <(jq -S 'del(."Tungstenite" | .. | .duration?)' "${OUTDIR}/index.json")
     then
         echo 'Difference in results, either this is a regression or' \
              'one should update autobahn/expected-results.json with the new results.'
@@ -41,13 +158,106 @@ function test_diff() {
     fi
 }
 
-cargo run --release --example autobahn-server --features=deflate & WSSERVER_PID=$!
-sleep 3
+# Build first so the PID we track and re-verify is the server itself: `cargo run &`
+# sets $! to the cargo wrapper, which proves nothing about the listener and whose
+# death can orphan it.
+function start_server() {
+    cargo build --release --example autobahn-server --features=deflate
+    "./${SERVER}" & WSSERVER_PID=$!
+    sleep 3
+    verify_server
+}
 
-docker run --rm \
-    -v "${PWD}/autobahn:/autobahn" \
-    --network host \
-    crossbario/autobahn-testsuite \
-    wstest -m fuzzingclient -s 'autobahn/fuzzingclient.json'
+# Every shard trusts that its results came from the server this run started, on the
+# port this run owns. A silent restart or a second listener would invalidate that.
+function verify_server() {
+    local pids command
+    if ! kill -0 "${WSSERVER_PID}" 2>/dev/null; then
+        echo "server ${WSSERVER_PID} is gone"
+        exit 70
+    fi
+    command=$(ps -o comm= -p "${WSSERVER_PID}" | tr -d ' ')
+    case "${command}" in
+        *autobahn-server) ;;
+        *) echo "PID ${WSSERVER_PID} is '${command}', not the Autobahn server"; exit 70 ;;
+    esac
+    pids=$(listener_pids "${PORT}")
+    if [ "${pids}" != "${WSSERVER_PID}" ]; then
+        echo "port ${PORT} is listened on by '${pids}', not by our server ${WSSERVER_PID}"
+        exit 70
+    fi
+}
 
+function run_shard() {
+    local shard=$1 directory container specification status=0
+    directory="${OUTDIR}/shard-${shard}"
+    container="fuzzingclient-shard-${shard}"
+    specification="${directory}/fuzzingclient.json"
+
+    verify_server
+    mkdir -p "${directory}"
+    shard_cases "${shard}" | jq -R -s --arg outdir "./${directory}" '{
+        outdir: $outdir,
+        servers: [{ agent: "Tungstenite", url: "ws://127.0.0.1:9002" }],
+        cases: (split("\n") | map(select(length > 0))),
+        "exclude-cases": [],
+        "exclude-agent-cases": {}
+    }' > "${specification}"
+
+    # PYTHONUNBUFFERED so a case ID in the log means a case: wstest's stdout
+    # otherwise flushes every ~103 cases and the last ID names a buffer boundary.
+    docker run --name "${container}" \
+        --memory="${SHARD_MEMORY}" \
+        -e PYTHONUNBUFFERED=1 \
+        -v "${PWD}/autobahn:/autobahn" \
+        --network host \
+        "${IMAGE}" \
+        wstest -m fuzzingclient -s "${specification}" &
+    local docker_pid=$!
+    ( sleep "${SHARD_TIMEOUT}"; kill -TERM "${docker_pid}" 2>/dev/null ) & WATCHDOG_PID=$!
+    wait "${docker_pid}" || status=$?
+    kill "${WATCHDOG_PID}" 2>/dev/null || true
+
+    if [ "${status}" -ne 0 ]; then
+        echo "shard ${shard}: docker exited ${status} (143 = the ${SHARD_TIMEOUT}s watchdog fired)"
+        docker inspect "${container}" --format \
+            'Running: {{.State.Running}}  OOMKilled: {{.State.OOMKilled}}  ExitCode: {{.State.ExitCode}}  Error: {{.State.Error}}'
+        exit "${status}"
+    fi
+    check_cases "${directory}/index.json" "$(shard_cases "${shard}" | case_array)"
+    verify_server
+    docker rm "${container}" >/dev/null
+}
+
+# The shards partition the suite, so their union must hold every case exactly once.
+# An overlap would let one shard's verdict quietly overwrite another's.
+function aggregate() {
+    local declared merged shard
+    local parts=()
+    while read -r shard; do
+        parts+=("${OUTDIR}/shard-${shard}/index.json")
+    done < <(shard_ids)
+    merged=$(jq -s '{ Tungstenite: (map(.Tungstenite) | add) }' "${parts[@]}")
+    declared=$(jq -s '[.[].Tungstenite | length] | add' "${parts[@]}")
+    printf '%s\n' "${merged}" > "${OUTDIR}/index.json"
+    if [ "${declared}" != "$(jq '.Tungstenite | length' "${OUTDIR}/index.json")" ]; then
+        echo "${OUTDIR}/index.json: the shards reported ${declared} cases but their union is smaller; they overlap"
+        exit 65
+    fi
+}
+
+require_tools
+acquire_lease
+preflight
+provenance start
+verify_manifest
+
+start_server
+for shard in $(shard_ids); do
+    run_shard "${shard}"
+done
+verify_server
+
+aggregate
 test_diff
+provenance end
