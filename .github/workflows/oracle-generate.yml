@@ -1,0 +1,97 @@
+name: Generate oracle
+
+on: [push, workflow_dispatch]
+
+# One role per job. A client role that exits 64 keeps its container as evidence,
+# and the server role's preflight refuses a host with an Autobahn container on it
+# -- correctly, since it cannot tell that container apart from a foreign one. In
+# the shipping workflow the two are steps in one job and a failing client aborts
+# the job before the server step, so this only bites a run like this one, which
+# expects both roles to disagree with the oracle and wants both indexes anyway.
+jobs:
+  client:
+    name: Client role, one complete feature-on stable run
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+
+      # 64 is the expected verdict: this tree's oracle still records the 216
+      # compression cases as UNIMPLEMENTED, which is the mismatch this run exists
+      # to resolve. 65 would mean the arm never completed and produced nothing.
+      - name: Client role
+        shell: bash
+        run: |
+          set -uo pipefail
+          status=0
+          ./scripts/autobahn-client.sh || status=$?
+          echo "client role exited ${status}"
+          [ "${status}" = 0 ] || [ "${status}" = 64 ]
+
+      - name: Report what it produced
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          index=autobahn/client/index.json
+          if jq -e . "${index}" > /dev/null 2>&1; then
+            echo "${index}: $(jq '.Tungstenite | length' "${index}") cases," \
+                 "$(jq -c '[.Tungstenite[].behavior] | group_by(.) | map({(.[0]): length}) | add' "${index}")," \
+                 "$(jq '[.Tungstenite[].duration] | add' "${index}") ms total"
+          else
+            echo "${index}: absent or malformed"
+          fi
+
+      - name: Upload the client index
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: client-index
+          path: autobahn/client
+
+  server:
+    name: Server role, one complete feature-on stable run
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+
+      - name: Server role
+        shell: bash
+        run: |
+          set -uo pipefail
+          status=0
+          ./scripts/autobahn-server.sh || status=$?
+          echo "server role exited ${status}"
+          [ "${status}" = 0 ] || [ "${status}" = 64 ]
+
+      - name: Report what it produced
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          index=autobahn/server/index.json
+          if jq -e . "${index}" > /dev/null 2>&1; then
+            echo "${index}: $(jq '.Tungstenite | length' "${index}") cases," \
+                 "$(jq -c '[.Tungstenite[].behavior] | group_by(.) | map({(.[0]): length}) | add' "${index}")," \
+                 "$(jq '[.Tungstenite[].duration] | add' "${index}") ms total"
+          else
+            echo "${index}: absent or malformed"
+          fi
+
+      - name: Upload the server aggregate and every shard
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-indexes
+          path: autobahn/server
