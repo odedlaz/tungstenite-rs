@@ -1,13 +1,16 @@
 //! Lever arm for the Autobahn tester-memory experiment: identical to
 //! `autobahn-server` except that our compression window is capped at 9 bits.
 //!
-//! Autobahn already offers `server_max_window_bits=9` on 36 of the 216
-//! compression cases and we already agree it; this arm moves the other 180 from
-//! 15 to 9, so the measurement covers the whole group rather than a sixth of it.
-//! On the 108 cases whose offer omits the parameter our response now demands it,
-//! which RFC 7692 §7.1.2.1 permits without a companion client-MUST-support --
-//! if wstest rejects it the handshake fails loudly and the arm is void, not
+//! Autobahn already offers `server_max_window_bits=9` on 54 of the 216
+//! compression cases and we already agree it; this arm moves the other 162 from
+//! 15 to 9, so the measurement covers the whole group rather than a quarter of
+//! it. On the 126 cases whose offer omits the parameter our response now demands
+//! it, which RFC 7692 §7.1.2.1 permits without a companion client-MUST-support
+//! -- if wstest rejects it the handshake fails loudly and the arm is void, not
 //! quietly cheaper.
+//!
+//! Measured null: wstest accepted all 126, and peak, onset and abort rate all
+//! matched the 15-bit default. The window is not a mitigation.
 
 use std::{
     net::{TcpListener, TcpStream},
@@ -35,7 +38,7 @@ fn handle_client(stream: TcpStream) -> Result<()> {
         stream,
         Some(WebSocketConfig::default().enable_deflate().deflate_max_window_bits(Role::Server, 9)),
     )
-        .map_err(must_not_block)?;
+    .map_err(must_not_block)?;
     info!("Running test");
     loop {
         match socket.read()? {
