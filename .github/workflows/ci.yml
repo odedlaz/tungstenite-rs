@@ -85,6 +85,9 @@ jobs:
     runs-on: ubuntu-latest
 
     strategy:
+      # HARVEST ONLY: one flaking arm must not cancel the siblings whose
+      # index.json we came for.
+      fail-fast: false
       matrix:
         rust:
           - stable
@@ -103,7 +106,10 @@ jobs:
       - name: Running Autobahn TestSuite for client
         run: ./scripts/autobahn-client.sh
 
+      # HARVEST ONLY: the client step exits 64 against a stale oracle, which
+      # would otherwise skip this step and leave the server index ungenerated.
       - name: Running Autobahn TestSuite for server
+        if: always()
         run: ./scripts/autobahn-server.sh
 
       # wstest writes index.json and the per-case reports into the mounted
