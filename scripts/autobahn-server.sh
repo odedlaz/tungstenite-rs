@@ -20,6 +20,9 @@ SHARD_TIMEOUT=${SHARD_TIMEOUT:-600}
 # Far above the ~1 GiB a nine-case shard is sized for and below the 6 GiB that has
 # killed a monolithic run: a runaway fails its own shard instead of the host.
 SHARD_MEMORY=${SHARD_MEMORY:-4g}
+# The example server installs no signal handler, so TERM ends it; this bounds the
+# case where that stops being true.
+SHUTDOWN_GRACE=${SHUTDOWN_GRACE:-10}
 # Only ever our own children. A container left behind by a failed shard is
 # evidence, and anything else on this host belongs to someone else.
 #
@@ -175,6 +178,33 @@ function verify_server() {
     fi
 }
 
+# Everything above proves the server was ours while it mattered. This proves the
+# host is clean afterwards, which is the next run's preflight and not something a
+# TERM we never waited on can establish.
+function shutdown_server() {
+    local pids
+    kill "${WSSERVER_PID}" 2>/dev/null || true
+    # A bare `wait` is unbounded, and a server that ignores TERM would spend the
+    # job's six-hour default on the last step of a run whose results are already
+    # collected and diffed. Escalate rather than wait on cooperation.
+    ( sleep "${SHUTDOWN_GRACE}"
+      kill -0 "${WSSERVER_PID}" 2>/dev/null || exit 0
+      echo "server ${WSSERVER_PID} outlived TERM by ${SHUTDOWN_GRACE}s; sending KILL"
+      kill -KILL "${WSSERVER_PID}" 2>/dev/null ) & WATCHDOG_PID=$!
+    wait "${WSSERVER_PID}" 2>/dev/null || true
+    kill "${WATCHDOG_PID}" 2>/dev/null || true
+    if kill -0 "${WSSERVER_PID}" 2>/dev/null; then
+        echo "server ${WSSERVER_PID} is still running after shutdown"
+        exit 70
+    fi
+    pids=$(listener_pids "${PORT}")
+    if [ -n "${pids}" ]; then
+        echo "port ${PORT} is still bound by PID(s) ${pids} after shutdown"
+        exit 70
+    fi
+    WSSERVER_PID=
+}
+
 function run_shard() {
     local shard=$1 directory container specification status=0
     directory="${OUTDIR}/shard-${shard}"
@@ -246,4 +276,6 @@ verify_server
 
 aggregate
 test_diff
+verify_server
+shutdown_server
 provenance end
