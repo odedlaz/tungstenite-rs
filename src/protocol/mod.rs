@@ -497,10 +497,13 @@ pub struct WebSocketContext {
     deflate: Option<deflate::Context>,
     #[cfg(feature = "deflate")]
     compressed_incomplete: bool,
-    /// A codec failure ended the connection. Separate from `WebSocketState` because the
-    /// states the base terminates with still permit a final flush; this one must not.
+    /// Compression state can no longer describe the peer's stream, by any of the routes
+    /// that reach it: a failed inflate, a decompressed-size limit, or a frame carrying
+    /// compressed payload that was rejected and discarded. Separate from `WebSocketState`
+    /// because the states the base terminates with still permit a final flush; this one
+    /// must not.
     #[cfg(feature = "deflate")]
-    codec_failed: bool,
+    compression_unrecoverable: bool,
 }
 
 impl WebSocketContext {
@@ -541,7 +544,7 @@ impl WebSocketContext {
             #[cfg(feature = "deflate")]
             compressed_incomplete: false,
             #[cfg(feature = "deflate")]
-            codec_failed: false,
+            compression_unrecoverable: false,
         }
     }
 
@@ -721,7 +724,7 @@ impl WebSocketContext {
         // Latched separately from `WebSocketState` because the states the base sets do
         // permit a final flush, and that is not ours to change.
         #[cfg(feature = "deflate")]
-        if self.codec_failed {
+        if self.compression_unrecoverable {
             return Err(Error::AlreadyClosed);
         }
         self._write(stream, None)?;
@@ -814,14 +817,43 @@ impl WebSocketContext {
         let max_size = self.config.max_message_size;
         let deflate = self.deflate.as_mut().expect("a compressed frame requires a codec");
         deflate.decompress(payload, final_frame, already, max_size).inspect_err(|_| {
-            self.codec_failed = true;
-            self.state = WebSocketState::Terminated;
+            self.fail_compression();
         })
+    }
+
+    /// Take the connection out of service because compression state is unrecoverable.
+    ///
+    /// The two fields move together and only here: `WebSocketState` stops `read` and
+    /// `write`, and the separate flag also stops `flush` and `close`, which the base's own
+    /// terminal states deliberately still allow.
+    #[cfg(feature = "deflate")]
+    fn fail_compression(&mut self) {
+        self.compression_unrecoverable = true;
+        self.state = WebSocketState::Terminated;
+    }
+
+    /// End the connection when a frame we are discarding carried compressed payload.
+    ///
+    /// `FrameCodec` has already split those bytes off the input buffer, and the peer's
+    /// compressor produced them, so our decoder can never see them and -- under context
+    /// takeover, the default -- can never rebuild the window they belong to. Discarding
+    /// them silently leaves a caller free to read on into wrong bytes, or into an error
+    /// blaming a later message that was never at fault.
+    #[cfg(feature = "deflate")]
+    fn fail_codec_on_discarded_compressed(&mut self, frame: &Frame) {
+        let compressed = match frame.header().opcode {
+            OpCode::Data(OpData::Continue) => self.compressed_incomplete,
+            OpCode::Data(_) => frame.header().rsv1,
+            OpCode::Control(_) => false,
+        };
+        if compressed && self.deflate.is_some() {
+            self.fail_compression();
+        }
     }
 
     /// Try to decode one message frame. May return None.
     fn read_message_frame(&mut self, stream: &mut impl Read) -> Result<Option<Message>> {
-        let frame = match self
+        let read = self
             .frame
             .read_frame(
                 stream,
@@ -829,8 +861,18 @@ impl WebSocketContext {
                 matches!(self.role, Role::Server),
                 self.config.accept_unmasked_frames,
             )
-            .check_connection_reset(self.state)?
+            .check_connection_reset(self.state);
+        // The only `read_frame` error raised after the payload is split off the input
+        // buffer; a header-parse or frame-size error leaves the bytes unread. So this is
+        // the one case where a frame vanishes before we can classify it, and while a
+        // compressed message is open those bytes may have been its continuation.
+        #[cfg(feature = "deflate")]
+        if self.compressed_incomplete
+            && matches!(read, Err(Error::Protocol(ProtocolError::UnmaskedFrameFromClient)))
         {
+            self.fail_compression();
+        }
+        let frame = match read? {
             None => {
                 // Connection closed by peer
                 return match replace(&mut self.state, WebSocketState::Terminated) {
@@ -853,7 +895,7 @@ impl WebSocketContext {
         // the negotiated extensions defines the meaning of such a nonzero
         // value, the receiving endpoint MUST _Fail the WebSocket
         // Connection_.
-        {
+        let reserved_bits_set = {
             let hdr = frame.header();
             #[cfg(not(feature = "deflate"))]
             let invalid_rsv1 = hdr.rsv1;
@@ -861,13 +903,18 @@ impl WebSocketContext {
             let invalid_rsv1 = hdr.rsv1
                 && (self.deflate.is_none()
                     || !matches!(hdr.opcode, OpCode::Data(OpData::Text | OpData::Binary)));
-            if invalid_rsv1 || hdr.rsv2 || hdr.rsv3 {
-                return Err(Error::Protocol(ProtocolError::NonZeroReservedBits));
-            }
+            invalid_rsv1 || hdr.rsv2 || hdr.rsv3
+        };
+        if reserved_bits_set {
+            #[cfg(feature = "deflate")]
+            self.fail_codec_on_discarded_compressed(&frame);
+            return Err(Error::Protocol(ProtocolError::NonZeroReservedBits));
         }
 
         if self.role == Role::Client && frame.is_masked() {
             // A client MUST close a connection if it detects a masked frame. (RFC 6455)
+            #[cfg(feature = "deflate")]
+            self.fail_codec_on_discarded_compressed(&frame);
             return Err(Error::Protocol(ProtocolError::MaskedFrameFromServer));
         }
 
@@ -906,8 +953,7 @@ impl WebSocketContext {
                 // back-reference it and decode to wrong bytes instead of failing. An
                 // uncompressed frame never entered that compressor, which is why only these
                 // two shapes end the connection; the error below is unchanged either way.
-                self.codec_failed = true;
-                self.state = WebSocketState::Terminated;
+                self.fail_compression();
             }
         }
 
@@ -1318,6 +1364,93 @@ mod codec_state_ownership {
         assert!(
             !matches!(alone.read(), Ok(Message::Binary(ref bytes)) if bytes.as_ref() == SECOND),
             "the second message must not decode correctly against a window without the first"
+        );
+    }
+
+    fn masked_frame_bytes(fin: bool, rsv1: bool, opcode: u8, payload: &[u8]) -> Vec<u8> {
+        const KEY: [u8; 4] = [0xa1, 0xb2, 0xc3, 0xd4];
+        assert!(payload.len() < 126, "the fixture keeps every header two bytes");
+        let first = (u8::from(fin) << 7) | (u8::from(rsv1) << 6) | opcode;
+        let mut out = vec![first, 0x80 | payload.len() as u8];
+        out.extend_from_slice(&KEY);
+        out.extend(payload.iter().enumerate().map(|(i, byte)| byte ^ KEY[i % 4]));
+        out
+    }
+
+    fn server(frames: &[u8]) -> WebSocket<Wire> {
+        WebSocket::from_raw_socket(
+            Wire::new(frames.to_vec()),
+            Role::Server,
+            Some(WebSocketConfig::default().enable_deflate()),
+        )
+    }
+
+    /// `FrameCodec` splits the whole payload off the input buffer before the host gets to
+    /// classify it, so a frame rejected here is already gone. When the peer's compressor
+    /// produced those bytes, our decoder can never see them, and reading on reaches wrong
+    /// bytes or an error blaming a later message. These are the whole-frame rejections;
+    /// a header-parse or frame-size error leaves the bytes unread and is not affected.
+    #[test]
+    fn a_discarded_compressed_frame_ends_the_connection() {
+        let (first, second) = peer_pair();
+
+        // Reserved bits, on a compressed message the peer's compressor already consumed.
+        let mut frames = frame_bytes(true, true, 0x2, &first);
+        frames[0] |= 0x20;
+        frames.extend(frame_bytes(true, true, 0x2, &second));
+        let mut socket = client(&frames);
+        assert!(matches!(
+            socket.read().unwrap_err(),
+            Error::Protocol(ProtocolError::NonZeroReservedBits)
+        ));
+        assert!(matches!(socket.read().unwrap_err(), Error::AlreadyClosed));
+
+        // A masked frame from a server, same shape.
+        let mut frames = masked_frame_bytes(true, true, 0x2, &first);
+        frames.extend(frame_bytes(true, true, 0x2, &second));
+        let mut socket = client(&frames);
+        assert!(matches!(
+            socket.read().unwrap_err(),
+            Error::Protocol(ProtocolError::MaskedFrameFromServer)
+        ));
+        assert!(matches!(socket.read().unwrap_err(), Error::AlreadyClosed));
+    }
+
+    /// The server-role twin, where `FrameCodec` rejects before the host sees a frame at
+    /// all -- so the decision can only rest on a compressed message being open.
+    #[test]
+    fn a_discarded_unmasked_continuation_ends_the_connection() {
+        let (first, _) = peer_pair();
+        let (head, tail) = first.split_at(first.len() / 2);
+        let mut frames = masked_frame_bytes(false, true, 0x2, head);
+        frames.extend(frame_bytes(false, false, 0x0, tail));
+        let mut socket = server(&frames);
+
+        assert!(matches!(
+            socket.read().unwrap_err(),
+            Error::Protocol(ProtocolError::UnmaskedFrameFromClient)
+        ));
+        assert!(matches!(socket.read().unwrap_err(), Error::AlreadyClosed));
+        assert!(matches!(socket.flush().unwrap_err(), Error::AlreadyClosed));
+    }
+
+    /// Without which any blanket latch passes the rows above. A rejection that discarded
+    /// no compressed payload leaves the connection exactly as it was.
+    #[test]
+    fn control_a_discarded_plain_frame_leaves_the_connection_open() {
+        let (_, second) = peer_pair();
+        let mut frames = frame_bytes(true, false, 0x2, b"plain");
+        frames[0] |= 0x20;
+        frames.extend(frame_bytes(true, true, 0x2, &second));
+        let mut socket = client(&frames);
+
+        assert!(matches!(
+            socket.read().unwrap_err(),
+            Error::Protocol(ProtocolError::NonZeroReservedBits)
+        ));
+        assert!(
+            !matches!(socket.read(), Err(Error::AlreadyClosed)),
+            "no compressed payload was discarded, so nothing is unrecoverable"
         );
     }
 
