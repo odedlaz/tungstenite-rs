@@ -33,9 +33,9 @@ pub enum Error {
     /// when it really shouldn't anymore, so it really indicates a programmer error on your
     /// part.
     ///
-    /// With deflate enabled, it is also returned once a read error has left the compression
-    /// state unrecoverable. The failing call returns the cause; every later operation
-    /// returns this. That route is not a programmer error.
+    /// With deflate enabled, it is also returned once the connection has ended because the
+    /// compression state can no longer be trusted. The failing call returns the cause;
+    /// every later operation returns this. That route is not a programmer error.
     #[error("Trying to work with closed connection")]
     AlreadyClosed,
     /// Input-output error. Apart from WouldBlock, these are generally errors with the
