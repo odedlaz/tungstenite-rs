@@ -2168,6 +2168,50 @@ mod write_transaction {
              message cannot shift its back-references"
         );
     }
+
+    /// The raw-frame path hands back a frame that is *already masked* -- the one shape
+    /// `wire_size` must never be given, because it would count the mask twice.
+    ///
+    /// `buffer_frame` masks a client frame before its own capacity check, so the frame
+    /// inside `WriteBufferFull` is four bytes longer than the one the caller passed in.
+    /// Nothing asserted that in either direction, and the `debug_assert!` in `wire_size`
+    /// is only worth its line while it holds.
+    ///
+    /// The cap sits one byte above the unmasked frame, so admission turns on the mask
+    /// alone: the server writes the same frame under the same cap.
+    #[test]
+    fn a_rejected_client_raw_frame_is_returned_masked() {
+        let frame = Frame::message(vec![b'z'; 400], OpCode::Data(OpData::Binary), true);
+        let unmasked = frame.len();
+        let config = WebSocketConfig::default()
+            .write_buffer_size(0)
+            .max_write_buffer_size(unmasked + 1)
+            .enable_deflate();
+
+        let mut server =
+            WebSocket::from_raw_socket(Recorder::default(), Role::Server, Some(config));
+        server.write(Message::Frame(frame.clone())).expect("a server frame fits under this cap");
+
+        let mut client =
+            WebSocket::from_raw_socket(Recorder::default(), Role::Client, Some(config));
+        match client.write(Message::Frame(frame)) {
+            Err(Error::WriteBufferFull(message)) => match *message {
+                Message::Frame(returned) => {
+                    assert!(
+                        returned.header().mask.is_some(),
+                        "the capacity check runs after masking, so the frame comes back masked"
+                    );
+                    assert_eq!(
+                        returned.len(),
+                        unmasked + 4,
+                        "and it is four bytes longer than the frame handed in"
+                    );
+                }
+                other => panic!("must carry a frame, got {other:?}"),
+            },
+            other => panic!("the mask is what pushes this frame past the cap: {other:?}"),
+        }
+    }
 }
 
 #[cfg(all(test, feature = "deflate"))]
