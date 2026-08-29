@@ -134,10 +134,22 @@ impl WebSocketConfig {
 
     /// Caps the LZ77 sliding window for one direction, in bits.
     ///
-    /// `role` selects the direction: [`Role::Server`] sets
+    /// `role` names the direction, not this endpoint: [`Role::Server`] sets
     /// `server_max_window_bits`, [`Role::Client`] sets `client_max_window_bits`.
-    /// Valid values are 9 to 15; smaller windows trade compression ratio for
-    /// memory, and this is the only knob that reduces per-connection memory.
+    /// Valid values are 9 to 15; a smaller window trades compression ratio for memory.
+    ///
+    /// Which encoder a setting names decides what it does:
+    ///
+    /// - **Your own** — [`Role::Client`] on a client, [`Role::Server`] on a server. Always
+    ///   applied when permessage-deflate is negotiated, and always saves memory locally.
+    /// - **The peer's** — [`Role::Server`] on a client, [`Role::Client`] on a server. A
+    ///   reduced cap here is a handshake requirement: on a client, [`Role::Server`]
+    ///   requires the response to select that cap or less; on a server, [`Role::Client`]
+    ///   accepts only an offer that permits the response to bind the client to that cap
+    ///   or less.
+    ///
+    /// A client's own cap is local only: it is not advertised, so the peer must still be
+    /// able to decode a 15-bit client window whatever we encode with.
     ///
     /// # Panics
     /// Panics if `bits` is outside 9..=15.

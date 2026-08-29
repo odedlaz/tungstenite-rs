@@ -16,12 +16,9 @@ pub(super) fn offer(settings: Settings) -> HeaderValue {
     if settings.server_max_window_bits < 15 {
         value.push_str(&format!("; server_max_window_bits={}", settings.server_max_window_bits));
     }
-    // Offering the parameter without a value invites any window down to 8, which
-    // `Compress::new_with_window_bits` will not build. Naming a cap is the only form
-    // every legal answer to it can be honoured.
-    if settings.client_max_window_bits < 15 {
-        value.push_str(&format!("; client_max_window_bits={}", settings.client_max_window_bits));
-    }
+    // Deliberately omitted: RFC 7692 §7.1.2.2 makes an offered client_max_window_bits a
+    // maximum, so naming any value invites a server answer of 8 — which flate2 cannot
+    // encode (it asserts 9..=15). The configured client cap stays local to our encoder.
     HeaderValue::from_str(&value).expect("the generated extension offer is valid")
 }
 
@@ -53,21 +50,10 @@ pub(super) fn accept_response(settings: Settings, headers: &HeaderMap) -> Result
         None if settings.server_max_window_bits < 15 => return Err(invalid_header()),
         None => {}
     }
-    match params.client_max_window_bits {
-        ClientWindow::Absent => {}
-        // RFC 7692 lets the server send client_max_window_bits only if we offered it. When
-        // our offer omits the parameter, a response carrying it is non-conformant -- fail
-        // the handshake rather than adopt a window we never proposed.
-        _ if settings.client_max_window_bits == 15 => return Err(invalid_header()),
-        // A valueless answer names no number, and the encoder needs one.
-        ClientWindow::NoValue => return Err(invalid_header()),
-        // Our own window comes back from the server's response. Below 9 the `Compress`
-        // constructor asserts, so refuse rather than clamp up. Server-role twin is in
-        // `accept_offer`.
-        ClientWindow::Bits(bits) if bits > settings.client_max_window_bits || bits < 9 => {
-            return Err(invalid_header());
-        }
-        ClientWindow::Bits(bits) => agreed.client_max_window_bits = bits,
+    // RFC 7692 permits client_max_window_bits in a response only when the offer
+    // included it. This client never does, so reject the unsolicited parameter.
+    if !matches!(params.client_max_window_bits, ClientWindow::Absent) {
+        return Err(invalid_header());
     }
     Ok(Some(agreed))
 }
@@ -94,9 +80,10 @@ fn accept_offer(settings: Settings, offer: Params) -> Option<(Settings, HeaderVa
     agreed.client_no_context_takeover |= offer.client_no_context_takeover;
 
     let server_window = match offer.server_max_window_bits {
-        // Twin of the client's guard in `accept_response`. An offered 8 would reach
-        // `Compress`, which asserts 9..=15. Refuse the offer; clamping to 9 would compress
-        // with a wider window than the client asked for.
+        // This is our own encoder's window, and an offered 8 would reach `Compress`, which
+        // asserts 9..=15. Refuse the offer; clamping to 9 would compress with a wider
+        // window than the client asked for. The client side has no twin for this any more:
+        // its offer omits the parameter, so `accept_response` rejects every answer to it.
         Some(8) => return None,
         Some(bits) => Some(bits.min(settings.server_max_window_bits)),
         None if settings.server_max_window_bits < 15 => Some(settings.server_max_window_bits),

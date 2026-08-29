@@ -493,16 +493,19 @@ mod tests {
         assert_eq!(agreed, Settings::default().no_context_takeover(Role::Client, true));
 
         assert!(invalid("x-example; value=\"a,b;c\", permessage-deflate"));
-        let capped_client = Settings::default().max_window_bits(Role::Client, 12);
+        // Quoted and escaped parameter values still parse; the value here is a server
+        // window, since a client window is no longer accepted in any form.
         let agreed = response(
-            Some("permessage-deflate; server_no_context_takeover; client_max_window_bits=\"1\\0\""),
-            Some(capped_client),
+            Some("permessage-deflate; server_no_context_takeover; server_max_window_bits=\"1\\0\""),
+            Some(Settings::default()),
         )
         .unwrap()
         .unwrap();
         assert_eq!(
             agreed,
-            capped_client.no_context_takeover(Role::Server, true).max_window_bits(Role::Client, 10)
+            Settings::default()
+                .no_context_takeover(Role::Server, true)
+                .max_window_bits(Role::Server, 10)
         );
 
         let capped = Settings::default().max_window_bits(Role::Server, 12);
@@ -513,24 +516,26 @@ mod tests {
             Some(capped)
         );
 
+        // `client_max_window_bits` is never offered, at the default or under a local cap:
+        // any value a server may legally answer includes 8, which the encoder cannot build.
+        let capped_client = Settings::default().max_window_bits(Role::Client, 12);
+        for settings in [Settings::default(), capped_client] {
+            assert_eq!(settings.offer().to_str().unwrap(), "permessage-deflate");
+        }
+        // So every answer to it is unsolicited, in either form, whatever we capped locally.
+        for answer in [
+            "permessage-deflate; client_max_window_bits",
+            "permessage-deflate; client_max_window_bits=10",
+        ] {
+            assert!(invalid(answer));
+            assert!(invalid_for(answer, Some(capped_client)));
+        }
+        // ...and the local cap survives a bare response, since omitting the parameter
+        // declares no constraint and encoding narrower than 15 is inside it.
         assert_eq!(
-            Settings::default().max_window_bits(Role::Client, 12).offer().to_str().unwrap(),
-            "permessage-deflate; client_max_window_bits=12"
-        );
-
-        // The default offer omits `client_max_window_bits`, so a server that answers it
-        // is naming a window we never proposed.
-        assert_eq!(
-            Settings::default().offer().to_str().unwrap(),
-            "permessage-deflate",
-            "the default offer must not invite a window the encoder cannot build"
-        );
-        assert!(invalid("permessage-deflate; client_max_window_bits=10"));
-        assert_eq!(
-            response(Some("permessage-deflate; client_max_window_bits=10"), Some(capped_client))
-                .unwrap(),
-            Some(capped_client.max_window_bits(Role::Client, 10)),
-            "the same answer is accepted once the offer has carried the parameter"
+            response(Some("permessage-deflate"), Some(capped_client)).unwrap(),
+            Some(capped_client),
+            "the configured cap stays on our own encoder"
         );
         // The sole-extension rule holds across repeated header fields, not just within one.
         let mut headers = http::HeaderMap::new();
