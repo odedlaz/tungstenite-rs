@@ -835,8 +835,10 @@ impl WebSocketContext {
     }
 
     /// End the connection when a frame whose payload will never reach our decoder carried
-    /// compressed bytes. The single classifier for every such path, so the answer cannot
-    /// differ by which one asked.
+    /// compressed bytes. Every rejection that can be followed by another decode asks this
+    /// one function, so the answer cannot differ by which of them asked. A frame arriving
+    /// after the read side has closed is discarded without asking, because the states that
+    /// close it are one-way and no later decode exists to corrupt.
     ///
     /// `FrameCodec` has already split those bytes off the input buffer, and the peer's
     /// compressor produced them, so our decoder can never see them and -- under context
