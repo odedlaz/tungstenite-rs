@@ -485,6 +485,10 @@ pub struct WebSocketContext {
     deflate: Option<deflate::Context>,
     #[cfg(feature = "deflate")]
     compressed_incomplete: bool,
+    /// A codec failure ended the connection. Separate from `WebSocketState` because the
+    /// states the base terminates with still permit a final flush; this one must not.
+    #[cfg(feature = "deflate")]
+    codec_failed: bool,
 }
 
 impl WebSocketContext {
@@ -524,6 +528,8 @@ impl WebSocketContext {
             deflate,
             #[cfg(feature = "deflate")]
             compressed_incomplete: false,
+            #[cfg(feature = "deflate")]
+            codec_failed: false,
         }
     }
 
@@ -698,6 +704,14 @@ impl WebSocketContext {
     where
         Stream: Read + Write,
     {
+        // Queued bytes belong to a connection the codec failure ended, so they are not
+        // written and neither is a close frame -- `close` reaches the stream through here.
+        // Latched separately from `WebSocketState` because the states the base sets do
+        // permit a final flush, and that is not ours to change.
+        #[cfg(feature = "deflate")]
+        if self.codec_failed {
+            return Err(Error::AlreadyClosed);
+        }
         self._write(stream, None)?;
         self.frame.write_out_buffer(stream)?;
         stream.flush()?;
@@ -780,14 +794,15 @@ impl WebSocketContext {
     /// A failed inflate has already consumed part of the peer's compressed stream, and
     /// DEFLATE offers no way to resynchronise a decoder, so every later frame would
     /// decode to garbage rather than fail. Terminating keeps `read` and `write` off the
-    /// stream while still allowing already-queued bytes to flush, as everywhere else
-    /// this state is set.
+    /// stream, and the separate latch keeps `flush` and `close` off it too -- the states
+    /// the base terminates with do allow a last flush, and this one must not.
     #[cfg(feature = "deflate")]
     fn decompress(&mut self, payload: &[u8], final_frame: bool) -> Result<bytes::Bytes> {
         let already = self.incomplete.as_ref().map(IncompleteMessage::len).unwrap_or(0);
         let max_size = self.config.max_message_size;
         let deflate = self.deflate.as_mut().expect("a compressed frame requires a codec");
         deflate.decompress(payload, final_frame, already, max_size).inspect_err(|_| {
+            self.codec_failed = true;
             self.state = WebSocketState::Terminated;
         })
     }
@@ -828,19 +843,12 @@ impl WebSocketContext {
         // Connection_.
         {
             let hdr = frame.header();
-            let invalid_rsv1 = if hdr.rsv1 {
-                #[cfg(feature = "deflate")]
-                {
-                    self.deflate.is_none()
-                        || !matches!(hdr.opcode, OpCode::Data(OpData::Text | OpData::Binary))
-                }
-                #[cfg(not(feature = "deflate"))]
-                {
-                    true
-                }
-            } else {
-                false
-            };
+            #[cfg(not(feature = "deflate"))]
+            let invalid_rsv1 = hdr.rsv1;
+            #[cfg(feature = "deflate")]
+            let invalid_rsv1 = hdr.rsv1
+                && (self.deflate.is_none()
+                    || !matches!(hdr.opcode, OpCode::Data(OpData::Text | OpData::Binary)));
             if invalid_rsv1 || hdr.rsv2 || hdr.rsv3 {
                 return Err(Error::Protocol(ProtocolError::NonZeroReservedBits));
             }
@@ -854,24 +862,22 @@ impl WebSocketContext {
         // The fragment-sequence check that rejects an illegal opcode transition lives in
         // the assembly match below, so test the same condition here: a frame that does not
         // own the message stream must not advance the inflater or overwrite the saved
-        // compressed mode before it is rejected. Neither is recoverable afterwards.
+        // compressed mode before it is rejected. Both are one-way.
         #[cfg(feature = "deflate")]
         if let OpCode::Data(data) = frame.header().opcode {
-            let owns_message = matches!(data, OpData::Continue) == self.incomplete.is_some();
-            let final_frame = frame.header().is_final;
-            let compressed = owns_message
-                && match data {
+            if matches!(data, OpData::Continue) == self.incomplete.is_some() {
+                let final_frame = frame.header().is_final;
+                let compressed = match data {
                     OpData::Text | OpData::Binary => frame.header().rsv1,
                     OpData::Continue => self.compressed_incomplete,
                     OpData::Reserved(_) => false,
                 };
-            if compressed {
-                let payload = self.decompress(frame.payload(), final_frame)?;
-                let mut header = frame.header().clone();
-                header.rsv1 = false;
-                frame = Frame::from_payload(header, payload);
-            }
-            if owns_message {
+                if compressed {
+                    let payload = self.decompress(frame.payload(), final_frame)?;
+                    let mut header = frame.header().clone();
+                    header.rsv1 = false;
+                    frame = Frame::from_payload(header, payload);
+                }
                 match data {
                     OpData::Text | OpData::Binary if !final_frame => {
                         self.compressed_incomplete = compressed;
@@ -879,6 +885,17 @@ impl WebSocketContext {
                     OpData::Continue if final_frame => self.compressed_incomplete = false,
                     _ => {}
                 }
+            } else if self.deflate.is_some()
+                && (frame.header().rsv1 || matches!(data, OpData::Continue))
+            {
+                // Skipping this frame is not recoverable either. Its bytes went through the
+                // peer's compressor, and context takeover is on by default, so the peer's
+                // window now holds plaintext ours never will -- a later legal message can
+                // back-reference it and decode to wrong bytes instead of failing. An
+                // uncompressed frame never entered that compressor, which is why only these
+                // two shapes end the connection; the error below is unchanged either way.
+                self.codec_failed = true;
+                self.state = WebSocketState::Terminated;
             }
         }
 
@@ -1204,8 +1221,9 @@ mod codec_state_ownership {
     /// plain Text arrives during an open compressed Binary message: it is illegal,
     /// but at the point the deflate precursor sees it, it looks like the start of
     /// an uncompressed message and clears the saved mode. The real continuation
-    /// then decodes as raw deflate bytes and `complete()` accepts them, so the
-    /// caller is handed a corrupt message with no error anywhere.
+    /// then decodes as raw deflate bytes and `complete()` accepts them. The stray
+    /// itself is reported; what is silent is the corruption, handed to the caller
+    /// as `Ok` on the following read.
     #[test]
     fn a_rejected_stray_frame_does_not_clear_the_saved_compressed_mode() {
         let mut frames = vec![0x42, 0x03];
@@ -1228,29 +1246,66 @@ mod codec_state_ownership {
         );
     }
 
-    /// The same ordering rule in the other direction: the rejected frame carries
-    /// RSV1, so the buggy order feeds it to the shared decoder, which no later
-    /// frame can resynchronise. The control is the compressed message that follows.
+    /// Two messages through one peer compressor, the second repeating a long run from the
+    /// first so it can only decode against a window that holds it.
+    const FIRST: &[u8] = b"permessage-deflate context takeover shares one window";
+    const SECOND: &[u8] = b"context takeover shares one window, so this back-references";
+
+    fn peer_pair() -> (Vec<u8>, Vec<u8>) {
+        let mut peer = deflate::Context::new(Role::Server, deflate::Settings::default());
+        let first = peer.compress(FIRST).expect("the peer compresses its first message");
+        let second = peer.compress(SECOND).expect("the peer compresses its second message");
+        (first.to_vec(), second.to_vec())
+    }
+
+    fn frame_bytes(fin: bool, rsv1: bool, opcode: u8, payload: &[u8]) -> Vec<u8> {
+        assert!(payload.len() < 126, "the fixture keeps every header two bytes");
+        let first = (u8::from(fin) << 7) | (u8::from(rsv1) << 6) | opcode;
+        let mut out = vec![first, payload.len() as u8];
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// The ordering rule in the other direction, and the reason skipping is not enough on
+    /// its own: this frame's bytes went through the peer's compressor, so declining to
+    /// decode them leaves its window holding plaintext ours never will. A later legal
+    /// message back-references that plaintext, and the mismatch produces wrong bytes rather
+    /// than an error, so the connection ends here instead.
     #[test]
-    fn a_rejected_stray_frame_does_not_advance_the_decoder() {
-        let mut frames = vec![0x02, 0x03, b'a', b'b', b'c', 0x41, 0x03];
-        frames.extend_from_slice(FIRST_FRAGMENT);
-        frames.extend_from_slice(&[0x80, 0x02, b'd', b'e', 0xc2, 0x07]);
-        frames.extend_from_slice(FIRST_FRAGMENT);
-        frames.extend_from_slice(LAST_FRAGMENT);
+    fn a_skipped_compressed_message_ends_the_connection() {
+        let (first, _) = peer_pair();
+        let mut frames = frame_bytes(false, false, 0x2, b"open");
+        frames.extend(frame_bytes(true, true, 0x2, &first));
+        frames.extend(frame_bytes(true, false, 0x0, b"close"));
 
         let mut socket = client(&frames);
         assert!(matches!(
             socket.read().unwrap_err(),
             Error::Protocol(ProtocolError::ExpectedFragment(_))
         ));
-        assert_eq!(
-            socket.read().expect("the plain message completes"),
-            Message::binary(b"abcde".to_vec())
+        assert!(
+            matches!(socket.read().unwrap_err(), Error::AlreadyClosed),
+            "the message that would have completed must not be read against a stale window"
         );
-        assert_eq!(
-            socket.read().expect("the decoder was never touched by the rejected frame"),
-            Message::binary(b"Hello".to_vec())
+    }
+
+    /// Without which the row above pins a connection ending for no reason. The second
+    /// message has to genuinely need the first in the decoder, or skipping one costs
+    /// nothing and terminating is unjustified.
+    #[test]
+    fn control_the_second_message_needs_the_first_in_the_decoder() {
+        let (first, second) = peer_pair();
+
+        let mut both = frame_bytes(true, true, 0x2, &first);
+        both.extend(frame_bytes(true, true, 0x2, &second));
+        let mut socket = client(&both);
+        assert_eq!(socket.read().expect("first message"), Message::binary(FIRST.to_vec()));
+        assert_eq!(socket.read().expect("second message"), Message::binary(SECOND.to_vec()));
+
+        let mut alone = client(&frame_bytes(true, true, 0x2, &second));
+        assert!(
+            !matches!(alone.read(), Ok(Message::Binary(ref bytes)) if bytes.as_ref() == SECOND),
+            "the second message must not decode correctly against a window without the first"
         );
     }
 
@@ -1284,6 +1339,89 @@ mod codec_state_ownership {
             Error::Capacity(CapacityError::MessageTooLong { .. })
         ));
         assert!(matches!(socket.read().unwrap_err(), Error::AlreadyClosed));
+    }
+
+    /// Reads scripted frames and records everything that reaches the stream, so a row can
+    /// assert that nothing did.
+    struct Wire {
+        inbound: Cursor<Vec<u8>>,
+        written: Vec<u8>,
+        flushes: usize,
+    }
+
+    impl Wire {
+        fn new(inbound: Vec<u8>) -> Self {
+            Self { inbound: Cursor::new(inbound), written: Vec::new(), flushes: 0 }
+        }
+    }
+
+    impl io::Read for Wire {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            io::Read::read(&mut self.inbound, buf)
+        }
+    }
+
+    impl io::Write for Wire {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.written.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushes += 1;
+            Ok(())
+        }
+    }
+
+    fn queued(inbound: Vec<u8>) -> WebSocket<Wire> {
+        let config = WebSocketConfig::default()
+            .enable_deflate()
+            // larger than the queued frame, so `write` buffers instead of draining
+            .write_buffer_size(64 * 1024);
+        let mut socket = WebSocket::from_raw_socket(Wire::new(inbound), Role::Client, Some(config));
+        socket.write(Message::binary(b"queued".to_vec())).expect("the frame queues");
+        assert!(socket.get_ref().written.is_empty(), "the fixture must leave the frame queued");
+        socket
+    }
+
+    /// Queue an outbound frame, then take an inbound inflate error, so each row below
+    /// starts from a terminated codec with bytes still waiting to go out.
+    fn queued_then_failed() -> WebSocket<Wire> {
+        let mut socket = queued(vec![0xc2, 0x03, 0xff, 0xff, 0xff]);
+        assert!(matches!(socket.read().unwrap_err(), Error::Protocol(ProtocolError::Compression)));
+        socket
+    }
+
+    fn nothing_reached_the_stream(socket: &WebSocket<Wire>) {
+        assert!(socket.get_ref().written.is_empty(), "no queued byte may reach the stream");
+        assert_eq!(socket.get_ref().flushes, 0, "the stream must not be flushed");
+    }
+
+    /// `read` and `write` refuse a terminated connection on their own; queued bytes reach
+    /// the stream through `flush`.
+    #[test]
+    fn a_codec_failure_keeps_queued_bytes_out_of_flush() {
+        let mut socket = queued_then_failed();
+        assert!(matches!(socket.flush().unwrap_err(), Error::AlreadyClosed));
+        nothing_reached_the_stream(&socket);
+    }
+
+    /// `close` reaches the stream through `flush` too, and it needs its own failed socket:
+    /// asserted after the flush row on a shared one, the flush assertion panics first on
+    /// any tree without the fix and this arm is never observed at all.
+    #[test]
+    fn a_codec_failure_keeps_queued_bytes_out_of_close() {
+        let mut socket = queued_then_failed();
+        assert!(matches!(socket.close(None).unwrap_err(), Error::AlreadyClosed));
+        nothing_reached_the_stream(&socket);
+    }
+
+    /// Without which the row above passes on a fixture that never had anything to write.
+    #[test]
+    fn control_the_same_queued_bytes_are_flushed_when_the_codec_is_healthy() {
+        let mut socket = queued(Vec::new());
+        socket.flush().expect("a healthy connection flushes");
+        assert!(!socket.get_ref().written.is_empty(), "the queued frame reaches the stream");
+        assert_eq!(socket.get_ref().flushes, 1);
     }
 
     /// Compression history is private, so a caller cannot keep it in step with a

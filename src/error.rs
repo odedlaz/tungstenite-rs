@@ -28,11 +28,14 @@ pub enum Error {
     ConnectionClosed,
     /// Trying to work with already closed connection.
     ///
-    /// Trying to read or write after receiving `ConnectionClosed` causes this.
+    /// Trying to read or write after receiving `ConnectionClosed` causes this. As opposed
+    /// to `ConnectionClosed`, that indicates your code tries to operate on the connection
+    /// when it really shouldn't anymore, so it really indicates a programmer error on your
+    /// part.
     ///
-    /// As opposed to `ConnectionClosed`, this indicates your code tries to operate on the
-    /// connection when it really shouldn't anymore, so this really indicates a programmer
-    /// error on your part.
+    /// It is also returned once a read error has left the compression state unrecoverable.
+    /// The failing call returns the cause; every later operation returns this. That route
+    /// is not a programmer error.
     #[error("Trying to work with closed connection")]
     AlreadyClosed,
     /// Input-output error. Apart from WouldBlock, these are generally errors with the
