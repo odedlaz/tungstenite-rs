@@ -1147,11 +1147,11 @@ mod rfc_7692_section_6_1 {
     use crate::error::ProtocolError;
     use std::io::Cursor;
 
-    /// The ported §6.1 rows. At `705e0cb` these were three tests against three
-    /// separate guards and three distinct error variants; the compact tree
-    /// collapses all of it into one `invalid_rsv1` decision reporting
-    /// `NonZeroReservedBits`, per `delete-error-fanout`. So the three rows stay
-    /// three rows -- one per rule -- but they now pin one variant.
+    /// One row per rule, and the rules come from two documents: RFC 7692 §6.1 forbids
+    /// the compressed bit on control frames and on non-first fragments, while RFC 6455
+    /// §5.2 forbids any reserved bit no negotiated extension has defined. All three
+    /// arrive at one `invalid_rsv1` decision reporting `NonZeroReservedBits`, so the
+    /// rows stay separate while pinning a single variant.
     fn reads_as_reserved_bits_error(frames: &[u8], deflate: bool) {
         let config = if deflate {
             WebSocketConfig::default().enable_deflate()
@@ -1504,9 +1504,9 @@ mod write_transaction {
     /// filler would leave the buffer nearly empty while the preflight measures the
     /// *plain* frame, and nothing would ever be rejected.
     fn noise(len: usize, seed: u8) -> Vec<u8> {
-        // splitmix64. A linear sequence is not incompressible -- an earlier
-        // version of this helper used `i * 37 + seed` and deflate took 300 bytes
-        // down to 276, which silently defeated the sizing every arm depends on.
+        // splitmix64. A linear sequence is not incompressible -- deflate takes 300
+        // bytes of `i * 37 + seed` down to 276, which would silently defeat the
+        // sizing every arm depends on.
         let mut x = u64::from(seed).wrapping_add(0x9E37_79B9_7F4A_7C15);
         (0..len)
             .map(|_| {
@@ -1601,8 +1601,7 @@ mod write_transaction {
         // A second message, now compressed, against a peer whose inflate window
         // never saw the first. It has to *share bytes* with the first, or the
         // encoder finds nothing to back-reference and a stale window is
-        // indistinguishable from a fresh one -- which is how an earlier version of
-        // this arm let the missing-reset mutant survive.
+        // indistinguishable from a fresh one.
         let second = payload[..120].to_vec();
         socket.write(Message::binary(second.clone())).expect("second send");
         socket.flush().expect("flush");

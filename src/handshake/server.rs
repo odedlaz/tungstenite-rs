@@ -409,8 +409,7 @@ mod tests {
     ///
     /// Without it the `101` advertises compression while `accept_deflate_offers`
     /// correctly installs none, because the request offered nothing: the wire and
-    /// the codec disagree with nothing red. That is the same divergence class as
-    /// the callback-removal defect at `705e0cb`, reached from the other side.
+    /// the codec disagree with nothing red.
     ///
     /// The unrelated name is refused for a second reason: automatic
     /// permessage-deflate is appended as the sole selection, so the `101` never
