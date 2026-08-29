@@ -1107,6 +1107,7 @@ impl WebSocketContext {
 /// always still pending.
 #[cfg(feature = "deflate")]
 fn wire_size(role: Role, frame: &Frame) -> usize {
+    debug_assert!(!frame.is_masked(), "wire_size adds the pending client mask itself");
     frame.len() + usize::from(role == Role::Client) * 4
 }
 
