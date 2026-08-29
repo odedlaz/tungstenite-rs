@@ -834,7 +834,9 @@ impl WebSocketContext {
         self.state = WebSocketState::Terminated;
     }
 
-    /// End the connection when a frame we are discarding carried compressed payload.
+    /// End the connection when a frame whose payload will never reach our decoder carried
+    /// compressed bytes. The single classifier for every such path, so the answer cannot
+    /// differ by which one asked.
     ///
     /// `FrameCodec` has already split those bytes off the input buffer, and the peer's
     /// compressor produced them, so our decoder can never see them and -- under context
@@ -842,13 +844,19 @@ impl WebSocketContext {
     /// them silently leaves a caller free to read on into wrong bytes, or into an error
     /// blaming a later message that was never at fault.
     #[cfg(feature = "deflate")]
-    fn fail_codec_on_discarded_compressed(&mut self, frame: &Frame) {
-        let compressed = match frame.header().opcode {
-            OpCode::Data(OpData::Continue) => self.compressed_incomplete,
-            OpCode::Data(_) => frame.header().rsv1,
-            OpCode::Control(_) => false,
-        };
-        if compressed && self.deflate.is_some() {
+    fn fail_compression_on_discarded_frame(&mut self, frame: &Frame) {
+        let header = frame.header();
+        // RSV1 is an explicit claim on compression state whatever the opcode, so a
+        // discarded control frame carrying it counts too. Without RSV1 only a continuation
+        // can be carrying compressed bytes: it does when the message it continues was
+        // compressed, and when there is no such message it carries bytes nothing left here
+        // can classify -- which under this contract is the same answer. An RSV1-clear
+        // continuation of an open plain message is the one that stays live. RSV2 and RSV3
+        // claim nothing about PMD.
+        let claims_compression = header.rsv1
+            || (matches!(header.opcode, OpCode::Data(OpData::Continue))
+                && (self.compressed_incomplete || self.incomplete.is_none()));
+        if claims_compression && self.deflate.is_some() {
             self.fail_compression();
         }
     }
@@ -911,14 +919,14 @@ impl WebSocketContext {
         };
         if reserved_bits_set {
             #[cfg(feature = "deflate")]
-            self.fail_codec_on_discarded_compressed(&frame);
+            self.fail_compression_on_discarded_frame(&frame);
             return Err(Error::Protocol(ProtocolError::NonZeroReservedBits));
         }
 
         if self.role == Role::Client && frame.is_masked() {
             // A client MUST close a connection if it detects a masked frame. (RFC 6455)
             #[cfg(feature = "deflate")]
-            self.fail_codec_on_discarded_compressed(&frame);
+            self.fail_compression_on_discarded_frame(&frame);
             return Err(Error::Protocol(ProtocolError::MaskedFrameFromServer));
         }
 
@@ -948,16 +956,13 @@ impl WebSocketContext {
                     OpData::Continue if final_frame => self.compressed_incomplete = false,
                     _ => {}
                 }
-            } else if self.deflate.is_some()
-                && (frame.header().rsv1 || matches!(data, OpData::Continue))
-            {
-                // Skipping this frame is not recoverable either. Its bytes went through the
-                // peer's compressor, and context takeover is on by default, so the peer's
-                // window now holds plaintext ours never will -- a later legal message can
-                // back-reference it and decode to wrong bytes instead of failing. An
-                // uncompressed frame never entered that compressor, which is why only these
-                // two shapes end the connection; the error below is unchanged either way.
-                self.fail_compression();
+            } else {
+                // Skipping this frame is not recoverable either: its bytes went through the
+                // peer's compressor and its window moved, while ours cannot. Same question
+                // as a frame discarded before the host saw it, so the same classifier
+                // answers it -- two predicates kept in step is the defect, not the fix.
+                // The error below is unchanged either way.
+                self.fail_compression_on_discarded_frame(&frame);
             }
         }
 
@@ -1512,6 +1517,144 @@ mod codec_state_ownership {
     fn standalone_compressed(payload: &[u8]) -> Vec<u8> {
         let mut peer = deflate::Context::new(Role::Server, deflate::Settings::default());
         peer.compress(payload).expect("the peer compresses a standalone message").to_vec()
+    }
+
+    /// The classifier's truth table, one row per cell that is not already pinned above.
+    /// RSV1 is an explicit claim on compression state whatever the opcode carries it.
+    #[test]
+    fn a_discarded_frame_claiming_compression_ends_the_connection() {
+        let compressed = standalone_compressed(FIRST);
+
+        // A continuation with no message to continue: nothing is left to classify it by,
+        // whether it claims compression or not, and at either discarding exit.
+        let mut stray_rsv2 = frame_bytes(true, false, 0x0, &compressed);
+        stray_rsv2[0] |= 0x20;
+        for frames in [
+            stray_rsv2,
+            frame_bytes(true, true, 0x0, &compressed),
+            masked_frame_bytes(true, false, 0x0, &compressed),
+        ] {
+            let mut socket = client(&frames);
+            assert!(socket.read().is_err(), "the stray continuation is rejected");
+            assert!(matches!(socket.read().unwrap_err(), Error::AlreadyClosed));
+        }
+
+        // A plain continuation of an open *compressed* message: no RSV1 claim of its own,
+        // but the message it continues had one.
+        let (head, tail) = compressed.split_at(compressed.len() / 2);
+        let mut frames = frame_bytes(false, true, 0x2, head);
+        let mut discarded = frame_bytes(true, false, 0x0, tail);
+        discarded[0] |= 0x20;
+        frames.extend(discarded);
+        let mut socket = client(&frames);
+        assert!(matches!(
+            socket.read().unwrap_err(),
+            Error::Protocol(ProtocolError::NonZeroReservedBits)
+        ));
+        assert!(matches!(socket.read().unwrap_err(), Error::AlreadyClosed));
+
+        // RSV1 on a continuation while a *plain* message is open. It is in position, so it
+        // never reaches the fragment-sequence branch, and `compressed_incomplete` is false
+        // -- only the RSV1 claim itself makes this unusable.
+        let mut frames = vec![0x02, 0x03, b'a', b'b', b'c'];
+        frames.extend(frame_bytes(true, true, 0x0, &compressed));
+        let mut socket = client(&frames);
+        assert!(matches!(
+            socket.read().unwrap_err(),
+            Error::Protocol(ProtocolError::NonZeroReservedBits)
+        ));
+        assert!(matches!(socket.read().unwrap_err(), Error::AlreadyClosed));
+
+        // RSV1 on a control frame: FIN + RSV1 + Ping, empty.
+        let mut socket = client(&[0xc9, 0x00]);
+        assert!(matches!(
+            socket.read().unwrap_err(),
+            Error::Protocol(ProtocolError::NonZeroReservedBits)
+        ));
+        assert!(matches!(socket.read().unwrap_err(), Error::AlreadyClosed));
+    }
+
+    /// The false cell, without which the row above is satisfied by latching on everything:
+    /// an RSV1-clear continuation of an open plain message carries no compressed bytes and
+    /// nothing about the peer's window changed, so discarding it costs nothing.
+    #[test]
+    fn control_a_discarded_plain_continuation_leaves_the_connection_open() {
+        // Open a plain message, discard one continuation on RSV2, then finish the message
+        // and send a compressed one. The discarded bytes are simply lost, as they are at
+        // base -- what must survive is the connection.
+        let mut frames = vec![
+            0x02, 0x03, b'a', b'b', b'c', // plain, non-final
+            0x20, 0x02, b'd', b'e', // continuation with RSV2: discarded
+            0x80, 0x02, b'f', b'g', // continuation, final
+        ];
+        frames.extend(frame_bytes(true, true, 0x2, &standalone_compressed(FIRST)));
+        let mut socket = client(&frames);
+
+        assert!(matches!(
+            socket.read().unwrap_err(),
+            Error::Protocol(ProtocolError::NonZeroReservedBits)
+        ));
+        assert_eq!(
+            socket.read().expect("nothing compressed was discarded"),
+            Message::binary(b"abcfg".to_vec()),
+            "the message completes without the frame that was thrown away"
+        );
+        assert_eq!(
+            socket.read().expect("and the decoder is still usable"),
+            Message::binary(FIRST.to_vec()),
+            "a later compressed message decodes exactly"
+        );
+    }
+
+    /// The second false cell: a control frame making no compression claim. Discarding it
+    /// says nothing about the peer's window, so the connection carries on.
+    #[test]
+    fn control_a_discarded_plain_control_frame_leaves_the_connection_open() {
+        // FIN | RSV2 | Ping, empty -- rejected for the reserved bit, claiming no RSV1.
+        let mut frames = vec![0xa9, 0x00];
+        frames.extend(frame_bytes(true, true, 0x2, &standalone_compressed(FIRST)));
+        let mut socket = client(&frames);
+
+        assert!(matches!(
+            socket.read().unwrap_err(),
+            Error::Protocol(ProtocolError::NonZeroReservedBits)
+        ));
+        assert_eq!(
+            socket.read().expect("a plain control frame claims nothing"),
+            Message::binary(FIRST.to_vec())
+        );
+    }
+
+    /// `read` refuses on `WebSocketState` alone, so a row that only reads cannot tell
+    /// whether the compression latch moved. `flush` is the observation that can: replacing
+    /// the classifier's `fail_compression()` with a bare state assignment passes every
+    /// read-only row and fails these two.
+    #[test]
+    fn a_discarded_compressed_frame_keeps_queued_bytes_off_the_stream() {
+        let mut frames = frame_bytes(true, true, 0x2, &standalone_compressed(FIRST));
+        frames[0] |= 0x20;
+        let mut socket = queued(frames);
+        assert!(matches!(
+            socket.read().unwrap_err(),
+            Error::Protocol(ProtocolError::NonZeroReservedBits)
+        ));
+        assert!(matches!(socket.flush().unwrap_err(), Error::AlreadyClosed));
+        nothing_reached_the_stream(&socket);
+    }
+
+    /// The same observation for the fragment-sequence caller, which is a different call
+    /// site into the same helper and would otherwise be pinned only by reads.
+    #[test]
+    fn a_skipped_compressed_message_keeps_queued_bytes_off_the_stream() {
+        let mut frames = frame_bytes(false, false, 0x2, b"open");
+        frames.extend(frame_bytes(true, true, 0x2, &standalone_compressed(FIRST)));
+        let mut socket = queued(frames);
+        assert!(matches!(
+            socket.read().unwrap_err(),
+            Error::Protocol(ProtocolError::ExpectedFragment(_))
+        ));
+        assert!(matches!(socket.flush().unwrap_err(), Error::AlreadyClosed));
+        nothing_reached_the_stream(&socket);
     }
 
     /// Without which any blanket latch passes the rows above. A rejection that discarded
