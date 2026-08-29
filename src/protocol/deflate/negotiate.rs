@@ -16,10 +16,11 @@ pub(super) fn offer(settings: Settings) -> HeaderValue {
     if settings.server_max_window_bits < 15 {
         value.push_str(&format!("; server_max_window_bits={}", settings.server_max_window_bits));
     }
+    // Offering the parameter without a value invites any window down to 8, which
+    // `Compress::new_with_window_bits` will not build. Naming a cap is the only form
+    // every legal answer to it can be honoured.
     if settings.client_max_window_bits < 15 {
         value.push_str(&format!("; client_max_window_bits={}", settings.client_max_window_bits));
-    } else {
-        value.push_str("; client_max_window_bits");
     }
     HeaderValue::from_str(&value).expect("the generated extension offer is valid")
 }
@@ -28,10 +29,12 @@ pub(super) fn accept_response(settings: Settings, headers: &HeaderMap) -> Result
     let mut selected = None;
     for value in headers.get_all(SEC_WEBSOCKET_EXTENSIONS) {
         for extension in split_header(value.as_bytes(), b',')? {
-            if let Some(params) = parse(extension)? {
-                if selected.replace(params).is_some() {
-                    return Err(invalid_header());
-                }
+            match parse(extension)? {
+                Extension::Empty => {}
+                Extension::Deflate(params) if selected.is_none() => selected = Some(params),
+                // The offer named permessage-deflate alone, so anything else here was
+                // never requested, and this socket has no codec to honour it with.
+                Extension::Deflate(_) | Extension::Other => return Err(invalid_header()),
             }
         }
     }
@@ -51,12 +54,20 @@ pub(super) fn accept_response(settings: Settings, headers: &HeaderMap) -> Result
         None => {}
     }
     match params.client_max_window_bits {
+        ClientWindow::Absent => {}
+        // RFC 7692 lets the server send client_max_window_bits only if we offered it. When
+        // our offer omits the parameter, a response carrying it is non-conformant -- fail
+        // the handshake rather than adopt a window we never proposed.
+        _ if settings.client_max_window_bits == 15 => return Err(invalid_header()),
+        // A valueless answer names no number, and the encoder needs one.
         ClientWindow::NoValue => return Err(invalid_header()),
+        // Our own window comes back from the server's response. Below 9 the `Compress`
+        // constructor asserts, so refuse rather than clamp up. Server-role twin is in
+        // `accept_offer`.
         ClientWindow::Bits(bits) if bits > settings.client_max_window_bits || bits < 9 => {
             return Err(invalid_header());
         }
         ClientWindow::Bits(bits) => agreed.client_max_window_bits = bits,
-        ClientWindow::Absent => {}
     }
     Ok(Some(agreed))
 }
@@ -67,7 +78,7 @@ pub(super) fn accept_offers(
 ) -> Option<(Settings, HeaderValue)> {
     for value in offers {
         for extension in split_header(value.as_bytes(), b',').into_iter().flatten() {
-            if let Ok(Some(offer)) = parse(extension) {
+            if let Ok(Extension::Deflate(offer)) = parse(extension) {
                 if let Some(accepted) = accept_offer(settings, offer) {
                     return Some(accepted);
                 }
@@ -83,6 +94,9 @@ fn accept_offer(settings: Settings, offer: Params) -> Option<(Settings, HeaderVa
     agreed.client_no_context_takeover |= offer.client_no_context_takeover;
 
     let server_window = match offer.server_max_window_bits {
+        // Twin of the client's guard in `accept_response`. An offered 8 would reach
+        // `Compress`, which asserts 9..=15. Refuse the offer; clamping to 9 would compress
+        // with a wider window than the client asked for.
         Some(8) => return None,
         Some(bits) => Some(bits.min(settings.server_max_window_bits)),
         None if settings.server_max_window_bits < 15 => Some(settings.server_max_window_bits),
@@ -135,15 +149,29 @@ enum ClientWindow {
     Bits(u8),
 }
 
-fn parse(extension: &[u8]) -> Result<Option<Params>> {
+/// One element of a `Sec-WebSocket-Extensions` list.
+///
+/// A server skips an extension it was not asked about; a client must fail on one it
+/// never offered. Keeping the two apart is the caller's decision, not the parser's.
+enum Extension {
+    Empty,
+    Deflate(Params),
+    Other,
+}
+
+fn parse(extension: &[u8]) -> Result<Extension> {
     let name = trim_ascii(extension.split(|byte| *byte == b';').next().unwrap_or_default());
     if name.is_empty() {
-        return if trim_ascii(extension).is_empty() { Ok(None) } else { Err(invalid_header()) };
+        return if trim_ascii(extension).is_empty() {
+            Ok(Extension::Empty)
+        } else {
+            Err(invalid_header())
+        };
     }
     // Classify the ASCII extension token before decoding its parameters so an
     // unrelated extension may carry any valid HeaderValue bytes.
     if !name.eq_ignore_ascii_case(NAME.as_bytes()) {
-        return Ok(None);
+        return Ok(Extension::Other);
     }
     let extension = std::str::from_utf8(extension).map_err(|_| invalid_header())?;
     let parts = split_quoted(extension, b';')?;
@@ -185,7 +213,7 @@ fn parse(extension: &[u8]) -> Result<Option<Params>> {
             _ => return Err(invalid_header()),
         }
     }
-    Ok(Some(parsed))
+    Ok(Extension::Deflate(parsed))
 }
 
 fn parse_bits(value: &str) -> Result<u8> {
@@ -197,32 +225,15 @@ fn parse_bits(value: &str) -> Result<u8> {
     value.parse::<u8>().ok().filter(|bits| (8..=15).contains(bits)).ok_or_else(invalid_header)
 }
 
+/// Split a UTF-8 field value on an unquoted ASCII delimiter.
+///
+/// Every split point is an ASCII byte outside a quoted string, so it is a character
+/// boundary and each part is still valid UTF-8.
 fn split_quoted(value: &str, delimiter: u8) -> Result<Vec<&str>> {
-    let mut parts = Vec::new();
-    let mut start = 0;
-    let mut quoted = false;
-    let mut escaped = false;
-    for (index, byte) in value.bytes().enumerate() {
-        if quoted {
-            if escaped {
-                escaped = false;
-            } else if byte == b'\\' {
-                escaped = true;
-            } else if byte == b'"' {
-                quoted = false;
-            }
-        } else if byte == b'"' {
-            quoted = true;
-        } else if byte == delimiter {
-            parts.push(&value[start..index]);
-            start = index + 1;
-        }
-    }
-    if quoted || escaped {
-        return Err(invalid_header());
-    }
-    parts.push(&value[start..]);
-    Ok(parts)
+    split_header(value.as_bytes(), delimiter)?
+        .into_iter()
+        .map(|part| std::str::from_utf8(part).map_err(|_| invalid_header()))
+        .collect()
 }
 
 fn unquote(value: &str) -> Result<Cow<'_, str>> {
@@ -274,35 +285,20 @@ fn split_header(value: &[u8], delimiter: u8) -> Result<Vec<&[u8]>> {
     Ok(parts)
 }
 
-pub(crate) fn headers_select_deflate(headers: &HeaderMap) -> bool {
+/// Does a peer's `Sec-WebSocket-Extensions` field select permessage-deflate?
+///
+/// Only for a selection this endpoint did not make. Just the extension token is read:
+/// an unrelated extension belongs to whoever negotiated it, and its parameters are not
+/// ours to validate. A list we cannot split is an error, never an absence.
+pub(crate) fn headers_select_deflate(headers: &HeaderMap) -> Result<bool> {
     for value in headers.get_all(SEC_WEBSOCKET_EXTENSIONS) {
-        let value = value.as_bytes();
-        let mut start = 0;
-        let mut quoted = false;
-        let mut escaped = false;
-        for (index, byte) in value.iter().copied().enumerate() {
-            if quoted {
-                if escaped {
-                    escaped = false;
-                } else if byte == b'\\' {
-                    escaped = true;
-                } else if byte == b'"' {
-                    quoted = false;
-                }
-            } else if byte == b'"' {
-                quoted = true;
-            } else if byte == b',' {
-                if extension_is_deflate(&value[start..index]) {
-                    return true;
-                }
-                start = index + 1;
+        for extension in split_header(value.as_bytes(), b',')? {
+            if extension_is_deflate(extension) {
+                return Ok(true);
             }
         }
-        if extension_is_deflate(&value[start..]) {
-            return true;
-        }
     }
-    false
+    Ok(false)
 }
 
 fn extension_is_deflate(extension: &[u8]) -> bool {

@@ -670,7 +670,16 @@ impl WebSocketContext {
                 return self._write(stream, None).map(|_| ());
             }
             Message::Close(code) => return self.close(stream, code),
-            Message::Frame(f) => f,
+            Message::Frame(frame) => {
+                // The encoder's history is private, so a caller cannot keep it in step with
+                // a frame it compressed itself. Under context takeover the next ordinary
+                // message would then reference a history the peer does not have.
+                #[cfg(feature = "deflate")]
+                if frame.header().rsv1 && self.deflate.is_some() {
+                    return Err(Error::Protocol(ProtocolError::NonZeroReservedBits));
+                }
+                frame
+            }
         };
 
         let should_flush = self._write(stream, Some(frame))?;
@@ -766,6 +775,23 @@ impl WebSocketContext {
         self.flush(stream)
     }
 
+    /// Inflate one frame's payload, ending the connection if the decoder fails.
+    ///
+    /// A failed inflate has already consumed part of the peer's compressed stream, and
+    /// DEFLATE offers no way to resynchronise a decoder, so every later frame would
+    /// decode to garbage rather than fail. Terminating keeps `read` and `write` off the
+    /// stream while still allowing already-queued bytes to flush, as everywhere else
+    /// this state is set.
+    #[cfg(feature = "deflate")]
+    fn decompress(&mut self, payload: &[u8], final_frame: bool) -> Result<bytes::Bytes> {
+        let already = self.incomplete.as_ref().map(IncompleteMessage::len).unwrap_or(0);
+        let max_size = self.config.max_message_size;
+        let deflate = self.deflate.as_mut().expect("a compressed frame requires a codec");
+        deflate.decompress(payload, final_frame, already, max_size).inspect_err(|_| {
+            self.state = WebSocketState::Terminated;
+        })
+    }
+
     /// Try to decode one message frame. May return None.
     fn read_message_frame(&mut self, stream: &mut impl Read) -> Result<Option<Message>> {
         let frame = match self
@@ -825,32 +851,34 @@ impl WebSocketContext {
             return Err(Error::Protocol(ProtocolError::MaskedFrameFromServer));
         }
 
+        // The fragment-sequence check that rejects an illegal opcode transition lives in
+        // the assembly match below, so test the same condition here: a frame that does not
+        // own the message stream must not advance the inflater or overwrite the saved
+        // compressed mode before it is rejected. Neither is recoverable afterwards.
         #[cfg(feature = "deflate")]
         if let OpCode::Data(data) = frame.header().opcode {
+            let owns_message = matches!(data, OpData::Continue) == self.incomplete.is_some();
             let final_frame = frame.header().is_final;
-            let compressed = match data {
-                OpData::Text | OpData::Binary => frame.header().rsv1,
-                OpData::Continue => self.compressed_incomplete,
-                OpData::Reserved(_) => false,
-            };
+            let compressed = owns_message
+                && match data {
+                    OpData::Text | OpData::Binary => frame.header().rsv1,
+                    OpData::Continue => self.compressed_incomplete,
+                    OpData::Reserved(_) => false,
+                };
             if compressed {
-                let already = self.incomplete.as_ref().map(IncompleteMessage::len).unwrap_or(0);
-                let payload = self.deflate.as_mut().unwrap().decompress(
-                    frame.payload(),
-                    final_frame,
-                    already,
-                    self.config.max_message_size,
-                )?;
+                let payload = self.decompress(frame.payload(), final_frame)?;
                 let mut header = frame.header().clone();
                 header.rsv1 = false;
                 frame = Frame::from_payload(header, payload);
             }
-            match data {
-                OpData::Text | OpData::Binary if !final_frame => {
-                    self.compressed_incomplete = compressed;
+            if owns_message {
+                match data {
+                    OpData::Text | OpData::Binary if !final_frame => {
+                        self.compressed_incomplete = compressed;
+                    }
+                    OpData::Continue if final_frame => self.compressed_incomplete = false,
+                    _ => {}
                 }
-                OpData::Continue if final_frame => self.compressed_incomplete = false,
-                _ => {}
             }
         }
 
@@ -960,9 +988,6 @@ impl WebSocketContext {
     where
         Stream: Read + Write,
     {
-        if !self.frame.can_buffer(wire_size(self.role, &frame)) {
-            return Err(Error::WriteBufferFull(Message::Frame(frame).into()));
-        }
         match self.role {
             Role::Server => {}
             Role::Client => {
@@ -988,8 +1013,13 @@ impl WebSocketContext {
     }
 }
 
+/// Wire bytes a prepared frame will occupy once `buffer_frame` has masked it.
+///
+/// Only ever called on a frame built moments earlier in `write`, so the client mask is
+/// always still pending.
+#[cfg(feature = "deflate")]
 fn wire_size(role: Role, frame: &Frame) -> usize {
-    frame.len() + usize::from(role == Role::Client && !frame.is_masked()) * 4
+    frame.len() + usize::from(role == Role::Client) * 4
 }
 
 fn check_max_size(size: usize, max_size: Option<usize>) -> crate::Result<()> {
@@ -1058,15 +1088,12 @@ impl<T> CheckConnectionReset for Result<T> {
     }
 }
 
-#[cfg(feature = "deflate")]
-#[cfg(test)]
-mod rfc_7692_section_6_1 {
-    use super::*;
-    use crate::error::ProtocolError;
+/// Read-only duplex: the deflate read rows drive `read()` over fixed frame bytes.
+#[cfg(all(test, feature = "deflate"))]
+mod incoming {
     use std::io::{self, Cursor};
 
-    /// Read-only duplex: these rows drive `read()` over fixed frame bytes.
-    struct Incoming(Cursor<Vec<u8>>);
+    pub(super) struct Incoming(pub(super) Cursor<Vec<u8>>);
 
     impl io::Read for Incoming {
         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
@@ -1082,6 +1109,14 @@ mod rfc_7692_section_6_1 {
             Ok(())
         }
     }
+}
+
+#[cfg(feature = "deflate")]
+#[cfg(test)]
+mod rfc_7692_section_6_1 {
+    use super::{incoming::Incoming, *};
+    use crate::error::ProtocolError;
+    use std::io::Cursor;
 
     /// The ported §6.1 rows. At `705e0cb` these were three tests against three
     /// separate guards and three distinct error variants; the compact tree
@@ -1143,6 +1178,134 @@ mod rfc_7692_section_6_1 {
             Some(WebSocketConfig::default().enable_deflate()),
         );
         assert_eq!(socket.read().expect("a legal compressed message"), Message::text("Hello"));
+    }
+}
+
+#[cfg(feature = "deflate")]
+#[cfg(test)]
+mod codec_state_ownership {
+    use super::{incoming::Incoming, *};
+    use crate::error::ProtocolError;
+    use std::io::Cursor;
+
+    fn client(frames: &[u8]) -> WebSocket<Incoming> {
+        WebSocket::from_raw_socket(
+            Incoming(Cursor::new(frames.to_vec())),
+            Role::Client,
+            Some(WebSocketConfig::default().enable_deflate()),
+        )
+    }
+
+    /// The compressed "Hello" of RFC 7692 7.2.3.2, split as the RFC splits it.
+    const FIRST_FRAGMENT: &[u8] = &[0xf2, 0x48, 0xcd];
+    const LAST_FRAGMENT: &[u8] = &[0xc9, 0xc9, 0x07, 0x00];
+
+    /// A frame the host will reject must not reach the codec first. Here a stray
+    /// plain Text arrives during an open compressed Binary message: it is illegal,
+    /// but at the point the deflate precursor sees it, it looks like the start of
+    /// an uncompressed message and clears the saved mode. The real continuation
+    /// then decodes as raw deflate bytes and `complete()` accepts them, so the
+    /// caller is handed a corrupt message with no error anywhere.
+    #[test]
+    fn a_rejected_stray_frame_does_not_clear_the_saved_compressed_mode() {
+        let mut frames = vec![0x42, 0x03];
+        frames.extend_from_slice(FIRST_FRAGMENT);
+        frames.extend_from_slice(&[0x01, 0x01, b'A']);
+        frames.extend_from_slice(&[0x80, 0x04]);
+        frames.extend_from_slice(LAST_FRAGMENT);
+
+        let mut socket = client(&frames);
+        assert!(
+            matches!(
+                socket.read().unwrap_err(),
+                Error::Protocol(ProtocolError::ExpectedFragment(_))
+            ),
+            "a new data frame during an open message is illegal"
+        );
+        assert_eq!(
+            socket.read().expect("the continuation is still part of a compressed message"),
+            Message::binary(b"Hello".to_vec())
+        );
+    }
+
+    /// The same ordering rule in the other direction: the rejected frame carries
+    /// RSV1, so the buggy order feeds it to the shared decoder, which no later
+    /// frame can resynchronise. The control is the compressed message that follows.
+    #[test]
+    fn a_rejected_stray_frame_does_not_advance_the_decoder() {
+        let mut frames = vec![0x02, 0x03, b'a', b'b', b'c', 0x41, 0x03];
+        frames.extend_from_slice(FIRST_FRAGMENT);
+        frames.extend_from_slice(&[0x80, 0x02, b'd', b'e', 0xc2, 0x07]);
+        frames.extend_from_slice(FIRST_FRAGMENT);
+        frames.extend_from_slice(LAST_FRAGMENT);
+
+        let mut socket = client(&frames);
+        assert!(matches!(
+            socket.read().unwrap_err(),
+            Error::Protocol(ProtocolError::ExpectedFragment(_))
+        ));
+        assert_eq!(
+            socket.read().expect("the plain message completes"),
+            Message::binary(b"abcde".to_vec())
+        );
+        assert_eq!(
+            socket.read().expect("the decoder was never touched by the rejected frame"),
+            Message::binary(b"Hello".to_vec())
+        );
+    }
+
+    /// A failed inflate has consumed part of the peer's stream and cannot be
+    /// resynchronised, so the connection ends rather than decoding the next frame
+    /// against a decoder that no longer describes it.
+    #[test]
+    fn a_decode_failure_ends_the_connection() {
+        let mut socket = client(&[0xc2, 0x03, 0xff, 0xff, 0xff, 0xc2, 0x07]);
+        assert!(matches!(socket.read().unwrap_err(), Error::Protocol(ProtocolError::Compression)));
+        assert!(matches!(socket.read().unwrap_err(), Error::AlreadyClosed));
+        assert!(matches!(
+            socket.write(Message::binary(b"later".to_vec())).unwrap_err(),
+            Error::AlreadyClosed
+        ));
+    }
+
+    /// A message over `max_message_size` is the one decode error a caller may
+    /// reasonably treat as recoverable, and it is not: the inflater stopped
+    /// part-way through the peer's stream just the same.
+    #[test]
+    fn an_oversized_decompressed_message_ends_the_connection_too() {
+        let mut frames = vec![0xc2, 0x07];
+        frames.extend_from_slice(FIRST_FRAGMENT);
+        frames.extend_from_slice(LAST_FRAGMENT);
+        let config = WebSocketConfig::default().enable_deflate().max_message_size(Some(2));
+        let mut socket =
+            WebSocket::from_raw_socket(Incoming(Cursor::new(frames)), Role::Client, Some(config));
+        assert!(matches!(
+            socket.read().unwrap_err(),
+            Error::Capacity(CapacityError::MessageTooLong { .. })
+        ));
+        assert!(matches!(socket.read().unwrap_err(), Error::AlreadyClosed));
+    }
+
+    /// Compression history is private, so a caller cannot keep it in step with a
+    /// frame it compressed itself; under context takeover the next ordinary
+    /// message would reference a history the peer does not have. The escape hatch
+    /// for raw frames stays open as long as the bit is clear.
+    #[test]
+    fn a_caller_owned_frame_may_not_claim_rsv1_while_deflate_is_negotiated() {
+        let mut socket = WebSocket::from_raw_socket(
+            Incoming(Cursor::new(Vec::new())),
+            Role::Server,
+            Some(WebSocketConfig::default().enable_deflate()),
+        );
+        let mut frame = Frame::message(vec![b'x'; 4], OpCode::Data(OpData::Binary), true);
+        frame.header_mut().rsv1 = true;
+        assert!(matches!(
+            socket.write(Message::Frame(frame)).unwrap_err(),
+            Error::Protocol(ProtocolError::NonZeroReservedBits)
+        ));
+
+        let frame = Frame::message(vec![b'x'; 4], OpCode::Data(OpData::Binary), true);
+        socket.write(Message::Frame(frame)).expect("an rsv1-clear raw frame still queues");
     }
 }
 
@@ -1431,37 +1594,6 @@ mod write_transaction {
         assert_eq!(peer.read().expect("peer reads the plain frame"), Message::binary(payload));
     }
 
-    /// A caller-owned frame bypasses both preparation checks, so retry admission
-    /// is the only place left to count the client mask. Its cap sits inside the
-    /// four-byte gap just as in arm six.
-    #[test]
-    fn arm_eight_client_retry_admission_counts_the_mask() {
-        let frame = Frame::message(vec![b'x'; 125], OpCode::Data(OpData::Binary), true);
-        let server_wire = wire_size(Role::Server, &frame);
-        let client_wire = wire_size(Role::Client, &frame);
-        assert_eq!(client_wire, server_wire + 4, "the fixture must isolate the mask term");
-        let cap = server_wire + 2;
-
-        let config = WebSocketConfig::default()
-            .write_buffer_size(0)
-            .max_write_buffer_size(cap)
-            .enable_deflate();
-        let mut socket =
-            WebSocket::from_raw_socket(Recorder::default(), Role::Client, Some(config));
-
-        match socket.write(Message::Frame(frame)) {
-            Err(Error::WriteBufferFull(message)) => match *message {
-                Message::Frame(frame) => {
-                    assert!(!frame.is_masked(), "the caller-owned frame is returned unchanged")
-                }
-                other => panic!("must carry the caller's frame, got {other:?}"),
-            },
-            other => {
-                panic!("the client mask makes the caller-owned frame exceed the cap: {other:?}")
-            }
-        }
-    }
-
     #[test]
     fn arm_one_immediate_retry_of_the_returned_frame() {
         let (a, b) = (noise(300, 1), noise(300, 2));
@@ -1517,7 +1649,7 @@ mod write_transaction {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "deflate"))]
 mod wire_size_tests {
     use super::*;
     use crate::protocol::frame::coding::{Data as OpData, OpCode};
@@ -1551,17 +1683,6 @@ mod wire_size_tests {
                 "a client masks at buffer time, so preflight must add 4 ({payload})"
             );
         }
-    }
-
-    /// Already-masked frames must not be charged twice -- the retry path admits a
-    /// `Message::Frame` that has been through `buffer_frame` before.
-    #[test]
-    fn an_already_masked_frame_is_not_charged_for_a_second_mask() {
-        let mut frame = Frame::message(vec![0u8; 8], OpCode::Data(OpData::Binary), true);
-        frame.set_random_mask();
-        assert!(frame.is_masked());
-        assert_eq!(wire_size(Role::Client, &frame), frame.len());
-        assert_eq!(wire_size(Role::Server, &frame), frame.len());
     }
 }
 

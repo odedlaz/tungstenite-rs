@@ -61,7 +61,11 @@ impl<S: Read + Write> ClientHandshake<S> {
 
         #[cfg(feature = "deflate")]
         if let Some(offer) = config.as_ref().and_then(|config| config.deflate.map(|d| d.offer())) {
-            if crate::protocol::deflate::headers_select_deflate(request.headers()) {
+            // Built-in permessage-deflate is negotiated as the sole extension. Tungstenite
+            // has no extension registry, so a 101 answering a request that names another
+            // one would attest a state this socket cannot honour. An embedder negotiating
+            // its own extensions builds the offer itself instead.
+            if request.headers().contains_key(http::header::SEC_WEBSOCKET_EXTENSIONS) {
                 return Err(Error::Protocol(ProtocolError::InvalidHeader(
                     http::header::SEC_WEBSOCKET_EXTENSIONS.clone().into(),
                 )));
@@ -323,12 +327,16 @@ impl VerifyData {
     ) -> Result<Option<crate::protocol::deflate::Settings>> {
         match offered {
             Some(offered) => offered.accept_response(response.headers()),
-            None if crate::protocol::deflate::headers_select_deflate(response.headers()) => {
-                Err(Error::Protocol(ProtocolError::InvalidHeader(
-                    http::header::SEC_WEBSOCKET_EXTENSIONS.clone().into(),
-                )))
+            // Nothing was offered, so a selection is the peer's invention. Any other
+            // extension here was negotiated by the embedder and is not ours to judge.
+            None => {
+                if crate::protocol::deflate::headers_select_deflate(response.headers())? {
+                    return Err(Error::Protocol(ProtocolError::InvalidHeader(
+                        http::header::SEC_WEBSOCKET_EXTENSIONS.clone().into(),
+                    )));
+                }
+                Ok(None)
             }
-            None => Ok(None),
         }
     }
 }
@@ -418,7 +426,7 @@ mod tests {
         assert!(response(Some(""), Some(Settings::default())).unwrap().is_none());
         assert!(invalid_for("permessage-deflate", None));
         assert!(invalid_for("permessage-deflate; x=\"unterminated", None));
-        assert!(response(Some("x-example; x=\"unterminated"), None).unwrap().is_none());
+        assert!(invalid_for("x-example; x=\"unterminated", None));
         assert!(response_value(
             Some(http::HeaderValue::from_bytes(b"x-example; x=\x80").unwrap()),
             None
@@ -432,12 +440,19 @@ mod tests {
             ),
             Err(Error::Protocol(ProtocolError::InvalidHeader(_)))
         ));
-        assert_eq!(
+        assert!(matches!(
             response_value(
                 Some(
                     http::HeaderValue::from_bytes(b"x-example; x=\x80, PerMessage-Deflate",)
                         .unwrap(),
                 ),
+                Some(Settings::default())
+            ),
+            Err(Error::Protocol(ProtocolError::InvalidHeader(_)))
+        ));
+        assert_eq!(
+            response_value(
+                Some(http::HeaderValue::from_bytes(b"PerMessage-Deflate").unwrap()),
                 Some(Settings::default())
             )
             .unwrap(),
@@ -477,17 +492,17 @@ mod tests {
         .unwrap();
         assert_eq!(agreed, Settings::default().no_context_takeover(Role::Client, true));
 
+        assert!(invalid("x-example; value=\"a,b;c\", permessage-deflate"));
+        let capped_client = Settings::default().max_window_bits(Role::Client, 12);
         let agreed = response(
-            Some("x-example; value=\"a,b;c\", permessage-deflate; server_no_context_takeover; client_max_window_bits=\"1\\0\""),
-            Some(Settings::default()),
+            Some("permessage-deflate; server_no_context_takeover; client_max_window_bits=\"1\\0\""),
+            Some(capped_client),
         )
         .unwrap()
         .unwrap();
         assert_eq!(
             agreed,
-            Settings::default()
-                .no_context_takeover(Role::Server, true)
-                .max_window_bits(Role::Client, 10)
+            capped_client.no_context_takeover(Role::Server, true).max_window_bits(Role::Client, 10)
         );
 
         let capped = Settings::default().max_window_bits(Role::Server, 12);
@@ -503,16 +518,28 @@ mod tests {
             "permessage-deflate; client_max_window_bits=12"
         );
 
+        // The default offer omits `client_max_window_bits`, so a server that answers it
+        // is naming a window we never proposed.
+        assert_eq!(
+            Settings::default().offer().to_str().unwrap(),
+            "permessage-deflate",
+            "the default offer must not invite a window the encoder cannot build"
+        );
+        assert!(invalid("permessage-deflate; client_max_window_bits=10"));
+        assert_eq!(
+            response(Some("permessage-deflate; client_max_window_bits=10"), Some(capped_client))
+                .unwrap(),
+            Some(capped_client.max_window_bits(Role::Client, 10)),
+            "the same answer is accepted once the offer has carried the parameter"
+        );
+        // The sole-extension rule holds across repeated header fields, not just within one.
         let mut headers = http::HeaderMap::new();
         headers.append("Sec-WebSocket-Extensions", "x-example".parse().unwrap());
-        headers.append(
-            "Sec-WebSocket-Extensions",
-            "permessage-deflate; client_max_window_bits=\"10\"".parse().unwrap(),
-        );
-        assert_eq!(
-            Settings::default().accept_response(&headers).unwrap(),
-            Some(Settings::default().max_window_bits(Role::Client, 10))
-        );
+        headers.append("Sec-WebSocket-Extensions", "permessage-deflate".parse().unwrap());
+        assert!(matches!(
+            Settings::default().accept_response(&headers),
+            Err(Error::Protocol(ProtocolError::InvalidHeader(_)))
+        ));
     }
 
     #[cfg(feature = "deflate")]
@@ -545,6 +572,22 @@ mod tests {
             Some(WebSocketConfig::default().enable_deflate()),
         );
         assert!(matches!(result, Err(Error::Protocol(ProtocolError::InvalidHeader(_)))));
+
+        // An unrelated extension is refused for the same reason as a competing one.
+        let mut request = "ws://localhost/path".into_client_request().unwrap();
+        request.headers_mut().append("Sec-WebSocket-Extensions", "x-example".parse().unwrap());
+        let result = ClientHandshake::start(
+            Cursor::new(Vec::new()),
+            request,
+            Some(WebSocketConfig::default().enable_deflate()),
+        );
+        assert!(matches!(result, Err(Error::Protocol(ProtocolError::InvalidHeader(_)))));
+
+        // Without the built-in offer the field is the embedder's, and start succeeds.
+        let mut request = "ws://localhost/path".into_client_request().unwrap();
+        request.headers_mut().append("Sec-WebSocket-Extensions", "x-example".parse().unwrap());
+        ClientHandshake::start(Cursor::new(Vec::new()), request, None)
+            .expect("an embedder keeps its own extension field when deflate is off");
     }
 
     #[cfg(feature = "deflate")]

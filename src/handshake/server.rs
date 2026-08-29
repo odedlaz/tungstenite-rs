@@ -269,16 +269,19 @@ impl<S: Read + Write, C: Callback> HandshakeRole for ServerHandshake<S, C> {
                     Ok(response) => {
                         #[cfg(feature = "deflate")]
                         let mut response = response;
-                        // A callback cannot advertise PMD even when it is disabled here:
-                        // the returned socket would have no codec for the state claimed by the 101.
-                        #[cfg(feature = "deflate")]
-                        if crate::protocol::deflate::headers_select_deflate(response.headers()) {
-                            return Err(Error::Protocol(ProtocolError::InvalidHeader(
-                                http::header::SEC_WEBSOCKET_EXTENSIONS.clone().into(),
-                            )));
-                        }
                         #[cfg(feature = "deflate")]
                         if self.config.as_ref().is_some_and(|config| config.deflate.is_some()) {
+                            // Built-in permessage-deflate is appended as the sole extension:
+                            // the 101 must not also attest a selection this socket has no
+                            // codec for. The callback keeps the field when deflate is off.
+                            if response
+                                .headers()
+                                .contains_key(http::header::SEC_WEBSOCKET_EXTENSIONS)
+                            {
+                                return Err(Error::Protocol(ProtocolError::InvalidHeader(
+                                    http::header::SEC_WEBSOCKET_EXTENSIONS.clone().into(),
+                                )));
+                            }
                             let offers = result
                                 .headers()
                                 .get_all(http::header::SEC_WEBSOCKET_EXTENSIONS)
@@ -296,6 +299,15 @@ impl<S: Read + Write, C: Callback> HandshakeRole for ServerHandshake<S, C> {
                                     .headers_mut()
                                     .append(http::header::SEC_WEBSOCKET_EXTENSIONS, agreed);
                             }
+                        } else if crate::protocol::deflate::headers_select_deflate(
+                            response.headers(),
+                        )? {
+                            // A callback cannot advertise permessage-deflate while it is
+                            // disabled here: the socket would have no codec for the state
+                            // the 101 claims.
+                            return Err(Error::Protocol(ProtocolError::InvalidHeader(
+                                http::header::SEC_WEBSOCKET_EXTENSIONS.clone().into(),
+                            )));
                         }
 
                         let mut output = vec![];
@@ -399,6 +411,10 @@ mod tests {
     /// correctly installs none, because the request offered nothing: the wire and
     /// the codec disagree with nothing red. That is the same divergence class as
     /// the callback-removal defect at `705e0cb`, reached from the other side.
+    ///
+    /// The unrelated name is refused for a second reason: automatic
+    /// permessage-deflate is appended as the sole selection, so the `101` never
+    /// attests an extension this socket has no codec for.
     #[cfg(feature = "deflate")]
     #[test]
     fn a_callback_injecting_an_extension_header_fails_the_handshake() {
@@ -409,7 +425,7 @@ mod tests {
              Sec-WebSocket-Version: 13\r\n\
              Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
              \r\n";
-        for injected in ["permessage-deflate", "PerMessage-Deflate"] {
+        for injected in ["permessage-deflate", "PerMessage-Deflate", "x-example"] {
             let stream = MockStream {
                 read: std::io::Cursor::new(request.as_bytes().to_vec()),
                 written: Vec::new(),

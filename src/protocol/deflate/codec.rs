@@ -31,6 +31,13 @@ impl Context {
                 settings.client_no_context_takeover,
             ),
         };
+        // flate2 asserts window bits 9..=15 in both constructors; RFC 7692 permits a
+        // negotiated 8. Peer window: no lower bound on either accept path, so a conformant
+        // peer can hold us to 8. Hence the clamp -- inflating with a wider window than the
+        // peer used is always safe. Own window: 8 is refused during negotiation, in
+        // `accept_response` (client) and `accept_offer` (server). Do not mirror the clamp
+        // onto the encoder; compressing wider than was negotiated emits backreferences the
+        // peer cannot resolve.
         Self {
             encoder: Compress::new_with_window_bits(settings.compression, false, own_window),
             decoder: Decompress::new_with_window_bits(false, peer_window.max(9)),

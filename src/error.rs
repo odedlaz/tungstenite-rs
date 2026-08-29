@@ -57,9 +57,7 @@ pub enum Error {
     ///
     /// With deflate enabled, a frame prepared from [`Message::Text`] or
     /// [`Message::Binary`] is returned uncompressed and may be retried in any
-    /// order or dropped without changing compression history. A caller-supplied
-    /// [`Message::Frame`] is returned unchanged, and its compression history
-    /// remains the caller's responsibility.
+    /// order or dropped without changing compression history.
     #[error("Write buffer is full")]
     WriteBufferFull(Box<Message>),
     /// UTF coding error.
