@@ -79,8 +79,9 @@ pub struct WebSocketConfig {
     /// and probably a little more depending on error handling strategy.
     /// With deflate enabled, “1 message” means its uncompressed full wire size;
     /// a larger message is unsendable regardless of how much the buffer drains.
-    /// If compression expands after admission, the message is sent uncompressed
-    /// and outgoing takeover history is reset before later compressed output.
+    /// A message that compresses larger than its plain form is still sent compressed while
+    /// it fits; only when the compressed wire form no longer fits is it sent uncompressed
+    /// instead, with outgoing takeover history reset before later compressed output.
     pub max_write_buffer_size: usize,
     /// The maximum size of an incoming message. `None` means no size limit. The default value is 64 MiB
     /// which should be reasonably big for all normal use-cases but small enough to prevent
@@ -855,6 +856,8 @@ impl WebSocketContext {
         // can classify -- which under this contract is the same answer. An RSV1-clear
         // continuation of an open plain message is the one that stays live. RSV2 and RSV3
         // claim nothing about PMD.
+        // "Claims" rather than "carries": the stray-continuation cell below latches because
+        // ownership is unclassifiable, not because those bytes are known to be compressed.
         let claims_compression = header.rsv1
             || (matches!(header.opcode, OpCode::Data(OpData::Continue))
                 && (self.compressed_incomplete || self.incomplete.is_none()));
@@ -962,8 +965,7 @@ impl WebSocketContext {
                 // Skipping this frame is not recoverable either: its bytes went through the
                 // peer's compressor and its window moved, while ours cannot. Same question
                 // as a frame discarded before the host saw it, so the same classifier
-                // answers it -- two predicates kept in step is the defect, not the fix.
-                // The error below is unchanged either way.
+                // answers it. The error below is unchanged either way.
                 self.fail_compression_on_discarded_frame(&frame);
             }
         }
@@ -1880,15 +1882,23 @@ mod write_transaction {
             .collect()
     }
 
+    /// Decode a recorded stream, refusing to mistake a decode failure for its end.
+    ///
+    /// Running out of bytes is the only acceptable way to stop; anything else means the
+    /// wire we produced does not decode, which is what these rows exist to detect. A loop
+    /// that stops on the first `Err` accepts the expected prefix followed by any garbage.
     fn decode_all(wire: &[u8]) -> Vec<Message> {
         let config = WebSocketConfig::default().enable_deflate();
         let mut peer =
             WebSocket::from_raw_socket(io::Cursor::new(wire.to_vec()), Role::Client, Some(config));
         let mut out = Vec::new();
-        while let Ok(message) = peer.read() {
-            out.push(message);
+        loop {
+            match peer.read() {
+                Ok(message) => out.push(message),
+                Err(Error::Protocol(ProtocolError::ResetWithoutClosingHandshake)) => return out,
+                Err(other) => panic!("the recorded wire failed to decode: {other:?}"),
+            }
         }
-        out
     }
 
     /// Fills the buffer, then offers a message the preflight must reject.
