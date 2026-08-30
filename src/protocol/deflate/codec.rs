@@ -10,37 +10,85 @@ use crate::{
 #[derive(Debug)]
 pub(crate) struct Context {
     encoder: Compress,
-    decoder: Decompress,
+    decoder: ConfiguredDecoder,
     reset_encoder: bool,
     reset_decoder: bool,
 }
 
+/// An inflater that remembers the window it was built with.
+///
+/// `Decompress::reset` takes no width and restores a 15-bit window on every backend flate2
+/// admits, so resetting a negotiated narrower decoder silently widens it. Reconstructing keeps
+/// the memory reduction those parameters exist for -- RFC 7692 §7.1.2.1 for a client's decoder,
+/// §7.1.2.2 for a server's -- across the whole connection, not until the first reset.
+#[derive(Debug)]
+struct ConfiguredDecoder {
+    stream: Decompress,
+    window_bits: u8,
+}
+
+/// A 15-bit inflater is what `Decompress::reset` produces anyway, so only a narrower one
+/// has to be rebuilt. Keeping the rule here rather than at the reset sites means both of
+/// them share it.
+fn reconstructs_on_reset(window_bits: u8) -> bool {
+    window_bits < 15
+}
+
+impl ConfiguredDecoder {
+    fn new(role: Role, settings: Settings) -> Self {
+        let peer_window = match role {
+            Role::Client => settings.server_max_window_bits,
+            Role::Server => settings.client_max_window_bits,
+        };
+        // flate2 asserts window bits 9..=15 in both constructors; RFC 7692 permits a
+        // negotiated 8. Neither accept path bounds the peer window from below, so a
+        // conformant peer can hold us to 8 -- hence the clamp. Inflating with a wider
+        // window than the peer encoded with is always safe.
+        let window_bits = peer_window.max(9);
+        Self { stream: Decompress::new_with_window_bits(false, window_bits), window_bits }
+    }
+
+    fn decompress(&mut self, input: &[u8], output: &mut [u8]) -> Result<(Status, usize, usize)> {
+        let before = (self.stream.total_in(), self.stream.total_out());
+        let status = self
+            .stream
+            .decompress(input, output, FlushDecompress::None)
+            .map_err(|_| ProtocolError::Compression)?;
+        let consumed = (self.stream.total_in() - before.0) as usize;
+        let produced = (self.stream.total_out() - before.1) as usize;
+        Ok((status, consumed, produced))
+    }
+
+    fn reset(&mut self) {
+        if reconstructs_on_reset(self.window_bits) {
+            self.stream = Decompress::new_with_window_bits(false, self.window_bits);
+        } else {
+            self.stream.reset(false);
+        }
+    }
+}
+
 impl Context {
     pub(crate) fn new(role: Role, settings: Settings) -> Self {
-        let (own_window, peer_window, reset_encoder, reset_decoder) = match role {
+        let (own_window, reset_encoder, reset_decoder) = match role {
             Role::Client => (
                 settings.client_max_window_bits,
-                settings.server_max_window_bits,
                 settings.client_no_context_takeover,
                 settings.server_no_context_takeover,
             ),
             Role::Server => (
                 settings.server_max_window_bits,
-                settings.client_max_window_bits,
                 settings.server_no_context_takeover,
                 settings.client_no_context_takeover,
             ),
         };
-        // flate2 asserts window bits 9..=15 in both constructors; RFC 7692 permits a
-        // negotiated 8. Peer window: no lower bound on either accept path, so a conformant
-        // peer can hold us to 8. Hence the clamp -- inflating with a wider window than the
-        // peer used is always safe. Own window: 8 is refused during negotiation, in
-        // `accept_response` (client) and `accept_offer` (server). Do not mirror the clamp
-        // onto the encoder; compressing wider than was negotiated emits backreferences the
-        // peer cannot resolve.
+        // An own window of 8 is refused during negotiation, in `accept_response` (client)
+        // and `accept_offer` (server), so the encoder needs no clamp -- and must not
+        // inherit the decoder's, because compressing wider than was negotiated emits
+        // backreferences the peer cannot resolve.
         Self {
             encoder: Compress::new_with_window_bits(settings.compression, false, own_window),
-            decoder: Decompress::new_with_window_bits(false, peer_window.max(9)),
+            decoder: ConfiguredDecoder::new(role, settings),
             reset_encoder,
             reset_decoder,
         }
@@ -108,7 +156,7 @@ impl Context {
         if final_frame {
             self.inflate(TRAILER, already, max_size, &mut output)?;
             if self.reset_decoder {
-                self.decoder.reset(false);
+                self.decoder.reset();
             }
         }
         Ok(output.into())
@@ -125,13 +173,8 @@ impl Context {
         loop {
             let remaining = max_size.saturating_sub(already.saturating_add(output.len()));
             let writable = remaining.saturating_add(1).min(scratch.len());
-            let before = (self.decoder.total_in(), self.decoder.total_out());
-            let status = self
-                .decoder
-                .decompress(input, &mut scratch[..writable], FlushDecompress::None)
-                .map_err(|_| ProtocolError::Compression)?;
-            let consumed = (self.decoder.total_in() - before.0) as usize;
-            let produced = (self.decoder.total_out() - before.1) as usize;
+            let (status, consumed, produced) =
+                self.decoder.decompress(input, &mut scratch[..writable])?;
             output.extend_from_slice(&scratch[..produced]);
             if already.saturating_add(output.len()) > max_size {
                 return Err(crate::error::CapacityError::MessageTooLong {
@@ -142,7 +185,7 @@ impl Context {
             }
             input = &input[consumed..];
             if status == Status::StreamEnd {
-                self.decoder.reset(false);
+                self.decoder.reset();
             }
             if !progress(status, consumed, produced)? {
                 return Ok(());
@@ -173,14 +216,44 @@ mod tests {
         )
     }
 
+    /// The decoder's width is the *peer's* agreed window, never the endpoint's own, and an
+    /// agreed 8 -- legal under RFC 7692, unconstructible in flate2 -- is stored as the
+    /// effective 9. Both cases set the two windows apart, because equal values would pass
+    /// whichever field the mapping read.
     #[test]
-    fn agreed_eight_bit_peer_window_inflates() {
+    fn the_configured_decoder_stores_the_peers_effective_window() {
+        let server = ConfiguredDecoder::new(
+            Role::Server,
+            Settings {
+                server_max_window_bits: 10,
+                client_max_window_bits: 15,
+                ..Settings::default()
+            },
+        );
+        assert_eq!(server.window_bits, 15);
+
+        let client = ConfiguredDecoder::new(
+            Role::Client,
+            Settings {
+                client_max_window_bits: 10,
+                server_max_window_bits: 8,
+                ..Settings::default()
+            },
+        );
+        assert_eq!(client.window_bits, 9, "an agreed 8 is stored as the constructible 9");
+
+        // `Decompress::reset` restores 15 whatever the stream was built with, so every
+        // narrower width has to be rebuilt and only 15 may keep the in-place path.
+        for bits in 9..=14 {
+            assert!(reconstructs_on_reset(bits), "a {bits}-bit decoder must be rebuilt");
+        }
+        assert!(!reconstructs_on_reset(15), "a 15-bit decoder keeps the in-place reset");
+
+        // The floored decoder still inflates what the peer encoded at its narrower window.
         let mut client = Context::new(
             Role::Client,
             Settings { server_max_window_bits: 8, ..Settings::default() },
         );
-        // flate2 only constructs 9..=15-bit streams. A negotiated peer window
-        // of 8 is legal, so the decoder clamps it to 9 rather than panicking.
         let mut server = Context::new(
             Role::Server,
             Settings { server_max_window_bits: 9, ..Settings::default() },

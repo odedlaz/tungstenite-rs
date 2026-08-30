@@ -578,31 +578,93 @@ mod tests {
         assert!(create_response(&req).is_ok());
     }
 
+    /// The pairing the soft cap exists for: this crate's own client sends exactly one
+    /// offer and never names `client_max_window_bits`, so a server that treated its
+    /// configured cap as a handshake requirement declined its own client outright.
     #[cfg(feature = "deflate")]
     #[test]
-    fn server_selects_first_acceptable_deflate_offer() {
-        use crate::protocol::{Role, WebSocketConfig};
+    fn a_reduced_cap_server_accepts_this_crates_own_bare_offer() {
+        use crate::protocol::{deflate::Settings, Role, WebSocketConfig};
 
-        let offers = [
-            "permessage-deflate".parse().unwrap(),
-            "permessage-deflate; server_max_window_bits=12".parse().unwrap(),
-            "permessage-deflate; client_max_window_bits=11; future=3".parse().unwrap(),
-            "permessage-deflate; client_no_context_takeover; client_max_window_bits=11"
-                .parse()
-                .unwrap(),
-            "permessage-deflate; client_max_window_bits=10".parse().unwrap(),
-        ];
+        let offers = [Settings::default().offer()];
         let (config, response) = WebSocketConfig::default()
             .enable_deflate()
             .deflate_max_window_bits(Role::Client, 11)
             .accept_deflate_offers(&offers);
+
+        assert_eq!(response.unwrap(), "permessage-deflate");
+        let agreed = config.deflate.expect("compression stays enabled");
+        // RFC 7692 §7.2.2: with no agreed client_max_window_bits the decoder window is
+        // 32 KiB, so the configured 11 must not survive into the runtime settings.
+        assert_eq!(agreed.client_max_window_bits, 15);
+    }
+
+    /// Under a reduced cap the server prefers an alternative that lets the response bind
+    /// the peer, and falls back to a full-window one only when the whole list holds none.
+    /// RFC 7692 §7.2.2 calls the offered parameter a hint for building the response, and
+    /// §7.1.3 lets the server pick any supported offer, so wire order yields inside that
+    /// preference -- but never between two offers of the same class, nor at the default cap.
+    #[cfg(feature = "deflate")]
+    #[test]
+    fn a_reduced_cap_prefers_a_binding_offer_over_an_earlier_fallback() {
+        use crate::protocol::{deflate::Settings, Role, WebSocketConfig};
+
+        fn accept(cap: u8, offers: &[&str]) -> (Option<Settings>, Option<http::HeaderValue>) {
+            let offers: Vec<http::HeaderValue> =
+                offers.iter().map(|offer| offer.parse().unwrap()).collect();
+            let (config, response) = WebSocketConfig::default()
+                .enable_deflate()
+                .deflate_max_window_bits(Role::Client, cap)
+                .accept_deflate_offers(&offers);
+            (config.deflate, response)
+        }
+
+        // The fourth offer is the first that permits binding, so it outranks the two
+        // full-window alternatives ahead of it and the narrower one behind it.
+        let (agreed, response) = accept(
+            11,
+            &[
+                "permessage-deflate",
+                "permessage-deflate; server_max_window_bits=12",
+                "permessage-deflate; client_max_window_bits=11; future=3",
+                "permessage-deflate; client_no_context_takeover; client_max_window_bits=11",
+                "permessage-deflate; client_max_window_bits=10",
+            ],
+        );
         assert_eq!(
             response.unwrap(),
             "permessage-deflate; client_no_context_takeover; client_max_window_bits=11"
         );
-        let agreed = config.deflate.unwrap();
+        let agreed = agreed.unwrap();
         assert!(agreed.client_no_context_takeover);
         assert_eq!(agreed.client_max_window_bits, 11);
+
+        // With nothing to bind, the retained fallback is the first one seen, not the last.
+        let (agreed, response) =
+            accept(11, &["permessage-deflate", "permessage-deflate; server_no_context_takeover"]);
+        assert_eq!(response.unwrap(), "permessage-deflate");
+        assert_eq!(agreed.unwrap().client_max_window_bits, 15);
+
+        // At the default cap there is nothing to prefer, so the first acceptable offer
+        // wins even though the second would have bound the peer.
+        let (agreed, response) =
+            accept(15, &["permessage-deflate", "permessage-deflate; client_max_window_bits=10"]);
+        assert_eq!(response.unwrap(), "permessage-deflate");
+        assert_eq!(agreed.unwrap().client_max_window_bits, 15);
+
+        // A named parameter is still capped, in both its forms and from both sides.
+        for (offer, expected) in [
+            ("permessage-deflate; client_max_window_bits", 11),
+            ("permessage-deflate; client_max_window_bits=12", 11),
+            ("permessage-deflate; client_max_window_bits=10", 10),
+        ] {
+            let (agreed, response) = accept(11, &[offer]);
+            assert_eq!(
+                response.unwrap(),
+                format!("permessage-deflate; client_max_window_bits={expected}")
+            );
+            assert_eq!(agreed.unwrap().client_max_window_bits, expected);
+        }
 
         let split =
             ["x-example; value=\"a,b;c\"".parse().unwrap(), "permessage-deflate".parse().unwrap()];

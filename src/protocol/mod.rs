@@ -143,14 +143,22 @@ impl WebSocketConfig {
     ///
     /// - **Your own** — [`Role::Client`] on a client, [`Role::Server`] on a server. Always
     ///   applied when permessage-deflate is negotiated, and always saves memory locally.
-    /// - **The peer's** — [`Role::Server`] on a client, [`Role::Client`] on a server. A
-    ///   reduced cap here is a handshake requirement: on a client, [`Role::Server`]
-    ///   requires the response to select that cap or less; on a server, [`Role::Client`]
-    ///   accepts only an offer that permits the response to bind the client to that cap
-    ///   or less.
+    /// - **The peer's, on a client** — [`Role::Server`]. A reduced cap is a handshake
+    ///   requirement: a response that does not select that cap or less fails the handshake.
+    /// - **The peer's, on a server** — [`Role::Client`]. A reduced cap is a preference, not
+    ///   a ceiling. An offer carrying `client_max_window_bits` is bound to the cap, or to
+    ///   the offer's own lower value. An offer that omits the parameter is still accepted,
+    ///   with a bare response and a 15-bit decoder: RFC 7692 §7.1.2.2 forbids naming the
+    ///   parameter in a response the offer did not invite, and §7.2.2 then requires a
+    ///   32,768-byte decoder window. Such a client bypasses the cap — the decoder window is
+    ///   the full 32 KiB rather than the `2^bits` bytes asked for.
+    ///   [`accept_deflate_offers`] prefers an offer the cap can bind when a client sends
+    ///   more than one.
     ///
     /// A client's own cap is local only: it is not advertised, so the peer must still be
     /// able to decode a 15-bit client window whatever we encode with.
+    ///
+    /// [`accept_deflate_offers`]: WebSocketConfig::accept_deflate_offers
     ///
     /// # Panics
     /// Panics if `bits` is outside 9..=15.
@@ -201,6 +209,16 @@ impl WebSocketConfig {
     /// agreed. On decline, the config has compression disabled and the header
     /// is `None`.
     ///
+    /// Which offer wins depends on the [`Role::Client`] window preference from
+    /// [`deflate_max_window_bits`]. At its default of 15, the first acceptable offer wins.
+    /// Under a reduced preference, an offer carrying `client_max_window_bits` outranks an
+    /// earlier one that omits it: only the former lets the response hold the client to the
+    /// preference, which is what RFC 7692 §7.1.2.2 gives the parameter for — a response
+    /// naming it reduces the memory the server reserves for the connection's decompression
+    /// context. Wire order decides within each group, and §7.1.3 lets a server pick any
+    /// supported offer. This changes which response header you send, never whether an offer
+    /// is acceptable.
+    ///
     /// If a header is returned, send it and use the config returned with it;
     /// applying only one would put the wire and codec into different states.
     /// Pass that config to [`WebSocket::from_raw_socket`].
@@ -209,6 +227,7 @@ impl WebSocketConfig {
     /// [`enable_deflate`].
     ///
     /// [`enable_deflate`]: WebSocketConfig::enable_deflate
+    /// [`deflate_max_window_bits`]: WebSocketConfig::deflate_max_window_bits
     #[cfg(feature = "deflate")]
     pub fn accept_deflate_offers(
         mut self,

@@ -62,16 +62,25 @@ pub(super) fn accept_offers(
     settings: Settings,
     offers: &[HeaderValue],
 ) -> Option<(Settings, HeaderValue)> {
+    // Only an offer that named client_max_window_bits lets the response bind the peer, and
+    // `accept_offer` gives every other accepted offer a window of 15. So an agreed window
+    // below 15 is exactly the cap-binding case, and under a reduced cap it outranks an
+    // earlier full-window alternative: RFC 7692 §5 only lowercase-recommends honouring the
+    // client's order, and §7.1.3 has the server "picking any supported one from the listed
+    // offers".
+    let mut fallback = None;
     for value in offers {
         for extension in split_header(value.as_bytes(), b',').into_iter().flatten() {
             if let Ok(Extension::Deflate(offer)) = parse(extension) {
-                if let Some(accepted) = accept_offer(settings, offer) {
+                let Some(accepted) = accept_offer(settings, offer) else { continue };
+                if settings.client_max_window_bits == 15 || accepted.0.client_max_window_bits < 15 {
                     return Some(accepted);
                 }
+                fallback.get_or_insert(accepted);
             }
         }
     }
-    None
+    fallback
 }
 
 fn accept_offer(settings: Settings, offer: Params) -> Option<(Settings, HeaderValue)> {
@@ -94,8 +103,12 @@ fn accept_offer(settings: Settings, offer: Params) -> Option<(Settings, HeaderVa
     }
 
     let client_window = match offer.client_max_window_bits {
-        ClientWindow::Absent if settings.client_max_window_bits < 15 => return None,
-        ClientWindow::Absent => None,
+        // RFC 7692 §7.2.2: with no agreed client_max_window_bits the server must decode a
+        // 32 KiB window, so a configured cap cannot bind a client that never offered one.
+        // Installing 15 rather than leaving the cap is what keeps the decoder large enough
+        // for output the peer is free to produce; the response still omits the parameter,
+        // which §7.1.2.2 requires of an offer that did not name it.
+        ClientWindow::Absent => Some(15),
         ClientWindow::NoValue => Some(settings.client_max_window_bits),
         ClientWindow::Bits(bits) => Some(bits.min(settings.client_max_window_bits)),
     };
