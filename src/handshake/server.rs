@@ -501,11 +501,13 @@ mod tests {
             );
         }
 
-        /// The pairing the soft cap exists for: this crate's own client sends exactly one
-        /// offer and never names `client_max_window_bits`, so a server that treated its
-        /// configured cap as a handshake requirement declined its own client outright.
+        /// The pairing the soft cap exists for: this crate's own client offers
+        /// `client_max_window_bits` with no value, so a reduced-cap server binds it and
+        /// reserves 2^11 bytes to decompress with. Against a client that omits the parameter
+        /// the cap cannot bind at all -- RFC 7692 §7.2.2 forces a 32 KiB decoder there, which
+        /// `a_reduced_cap_prefers_a_binding_offer_over_an_earlier_fallback` still covers.
         #[test]
-        fn a_reduced_cap_server_accepts_this_crates_own_bare_offer() {
+        fn a_reduced_cap_server_binds_this_crates_own_offer() {
             use crate::protocol::{deflate::Settings, Role, WebSocketConfig};
 
             let offers = [Settings::default().offer()];
@@ -514,10 +516,9 @@ mod tests {
                 .deflate_max_window_bits(Role::Client, 11)
                 .accept_deflate_offers(&offers);
 
-            assert_eq!(response.unwrap(), "permessage-deflate");
+            assert_eq!(response.unwrap(), "permessage-deflate; client_max_window_bits=11");
             let agreed = config.deflate.expect("compression stays enabled");
-            // RFC 7692 §7.2.2 makes the decoder 32 KiB here, so the configured 11 must not survive.
-            assert_eq!(agreed.client_max_window_bits, 15);
+            assert_eq!(agreed.client_max_window_bits, 11);
         }
 
         /// Under a reduced cap the server prefers an alternative that lets the response bind
