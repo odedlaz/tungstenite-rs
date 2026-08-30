@@ -19,18 +19,41 @@ RESULTS='autobahn/client/index.json'
 SPEC='autobahn/fuzzingserver.json'
 READY_TIMEOUT_SECONDS=30
 
+RUN_DIR=''
+TESTER_CID_FILE=''
 CONTAINER_ID=''
-TESTER_NAME="autobahn-deflate-client-$$"
 function cleanup() {
     # One line on purpose: `local` is a command, so declaring first would overwrite `$?`.
-    local status=$?
+    # TERM and INT supply their own status: a signal to this PID alone, during a command
+    # that then succeeds, leaves `$?` at zero, and `${1:-$?}` is what keeps EXIT unaffected.
+    local status=${1:-$?}
     trap - TERM INT EXIT
+    # From docker's own write, not the assignment below: a signal during `docker create`
+    # would never reach it and would leave a container nothing owns.
+    if [ -z "${CONTAINER_ID}" ] && [ -n "${TESTER_CID_FILE}" ]; then
+        CONTAINER_ID=$(cat "${TESTER_CID_FILE}" 2>/dev/null || true)
+    fi
     if [ -n "${CONTAINER_ID}" ]; then
-        docker container stop "${CONTAINER_ID}" >/dev/null || true
+        docker container stop "${CONTAINER_ID}" >/dev/null 2>&1 || true
+        # Emitted before removal, from the one site every path reaches: `--rm` would have
+        # erased exactly this on the exit-137 path.
+        docker container inspect "${CONTAINER_ID}" \
+            --format 'tester: terminal ExitCode={{.State.ExitCode}} OOMKilled={{.State.OOMKilled}}' \
+            2>/dev/null || true
+        docker container rm "${CONTAINER_ID}" >/dev/null 2>&1 || true
+    fi
+    if [ -n "${RUN_DIR}" ]; then
+        if [ "${status}" -eq 0 ]; then
+            rm -rf "${RUN_DIR}"
+        else
+            echo "cleanup: run state retained at ${RUN_DIR}" >&2
+        fi
     fi
     exit "${status}"
 }
-trap cleanup TERM INT EXIT
+trap 'cleanup 143' TERM
+trap 'cleanup 130' INT
+trap cleanup EXIT
 
 function verify_image() {
     # Asked of the registry, so it checks the pin itself and not whatever the local store
@@ -133,15 +156,23 @@ if port_accepts; then
     exit 69
 fi
 
-CONTAINER_ID=$(docker run -d --rm \
-    --name "${TESTER_NAME}" \
+# An explicit `XXXXXX` template (`mktemp -t <name>` is BSD-only), giving the cidfile a path
+# that does not exist yet, which `docker create` requires -- it refuses to clobber one.
+RUN_DIR=$(mktemp -d "${TMPDIR:-/tmp}/autobahn-client-deflate.XXXXXX")
+TESTER_CID_FILE="${RUN_DIR}/tester.cid"
+
+# `create` then `start`, so the ID exists before anything runs. No `--rm`: it deletes the
+# container and with it the terminal state an exit 137 is diagnosed from.
+docker create --cidfile "${TESTER_CID_FILE}" \
     --platform linux/amd64 \
     -v "${PWD}/autobahn:/autobahn" \
     -p 9001:9001 \
     --init \
     "${IMAGE}" \
-    wstest -m fuzzingserver -s 'autobahn/fuzzingserver.json')
-echo "tester: container ${CONTAINER_ID} named ${TESTER_NAME}"
+    wstest -m fuzzingserver -s 'autobahn/fuzzingserver.json' >/dev/null
+CONTAINER_ID=$(cat "${TESTER_CID_FILE}")
+docker start "${CONTAINER_ID}" >/dev/null
+echo "tester: container ${CONTAINER_ID}"
 
 await_tester_ready
 
