@@ -385,244 +385,250 @@ mod tests {
     use crate::client::IntoClientRequest;
 
     #[cfg(feature = "deflate")]
-    #[test]
-    fn client_response_validation() {
-        use super::VerifyData;
-        use crate::{
-            error::ProtocolError,
-            protocol::{deflate::Settings, Role},
-            Error,
-        };
+    mod deflate {
+        use super::*;
 
-        let accept = crate::handshake::derive_accept_key(b"dGhlIHNhbXBsZSBub25jZQ==");
-        let verify = VerifyData { accept_key: accept.clone(), subprotocols: None };
-        let response_value = |header: Option<http::HeaderValue>, offered: Option<Settings>| {
-            let mut response = http::Response::builder()
+        #[test]
+        fn client_response_validation() {
+            use super::super::VerifyData;
+            use crate::{
+                error::ProtocolError,
+                protocol::{deflate::Settings, Role},
+                Error,
+            };
+
+            let accept = crate::handshake::derive_accept_key(b"dGhlIHNhbXBsZSBub25jZQ==");
+            let verify = VerifyData { accept_key: accept.clone(), subprotocols: None };
+            let response_value = |header: Option<http::HeaderValue>, offered: Option<Settings>| {
+                let mut response = http::Response::builder()
+                    .status(101)
+                    .header("Connection", "Upgrade")
+                    .header("Upgrade", "websocket")
+                    .header("Sec-WebSocket-Accept", accept.clone());
+                if let Some(header) = header {
+                    response = response.header("Sec-WebSocket-Extensions", header);
+                }
+                let response = verify.verify_response(response.body(None).unwrap())?;
+                verify.verify_deflate_response(&response, offered)
+            };
+            let response = |header: Option<&str>, offered: Option<Settings>| {
+                response_value(header.map(|value| value.parse().unwrap()), offered)
+            };
+            let invalid_for = |header, offered| {
+                // The compact API deliberately collapses every invalid PMD response
+                // to InvalidHeader. These rows pin acceptance and installed state,
+                // not the private parser route that produced the error.
+                matches!(
+                    response(Some(header), offered),
+                    Err(Error::Protocol(ProtocolError::InvalidHeader(_)))
+                )
+            };
+            let invalid = |header| invalid_for(header, Some(Settings::default()));
+
+            assert!(response(None, Some(Settings::default())).unwrap().is_none());
+            assert!(response(Some(""), Some(Settings::default())).unwrap().is_none());
+            assert!(invalid_for("permessage-deflate", None));
+            assert!(invalid_for("permessage-deflate; x=\"unterminated", None));
+            assert!(invalid_for("x-example; x=\"unterminated", None));
+            assert!(response_value(
+                Some(http::HeaderValue::from_bytes(b"x-example; x=\x80").unwrap()),
+                None
+            )
+            .unwrap()
+            .is_none());
+            assert!(matches!(
+                response_value(
+                    Some(http::HeaderValue::from_bytes(b"permessage-deflate; x=\x80").unwrap()),
+                    None
+                ),
+                Err(Error::Protocol(ProtocolError::InvalidHeader(_)))
+            ));
+            assert!(matches!(
+                response_value(
+                    Some(
+                        http::HeaderValue::from_bytes(b"x-example; x=\x80, PerMessage-Deflate",)
+                            .unwrap(),
+                    ),
+                    Some(Settings::default())
+                ),
+                Err(Error::Protocol(ProtocolError::InvalidHeader(_)))
+            ));
+            assert_eq!(
+                response_value(
+                    Some(http::HeaderValue::from_bytes(b"PerMessage-Deflate").unwrap()),
+                    Some(Settings::default())
+                )
+                .unwrap(),
+                Some(Settings::default())
+            );
+            assert!(invalid(";x"));
+            assert!(invalid("permessage-deflate; client_max_window_bits"));
+            assert!(invalid("permessage-deflate; client_max_window_bits=09"));
+            assert!(invalid("permessage-deflate; client_max_window_bits=+9"));
+            assert!(invalid(
+                "permessage-deflate; client_max_window_bits=12; client_max_window_bits=12"
+            ));
+            let agreed = response(
+                Some("permessage-deflate; server_max_window_bits=8"),
+                Some(Settings::default()),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(agreed, Settings { server_max_window_bits: 8, ..Settings::default() });
+            assert!(invalid_for(
+                "permessage-deflate",
+                Some(Settings::default().no_context_takeover(Role::Server, true))
+            ));
+            let agreed = response(
+                Some("permessage-deflate"),
+                Some(Settings::default().no_context_takeover(Role::Client, true)),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(agreed, Settings::default().no_context_takeover(Role::Client, true));
+
+            let agreed = response(
+                Some("permessage-deflate; client_no_context_takeover"),
+                Some(Settings::default()),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(agreed, Settings::default().no_context_takeover(Role::Client, true));
+
+            assert!(invalid("x-example; value=\"a,b;c\", permessage-deflate"));
+            // Quoted and escaped parameter values still parse; the value here is a server
+            // window, since a client window is no longer accepted in any form.
+            let agreed = response(
+                Some("permessage-deflate; server_no_context_takeover; server_max_window_bits=\"1\\0\""),
+                Some(Settings::default()),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                agreed,
+                Settings::default()
+                    .no_context_takeover(Role::Server, true)
+                    .max_window_bits(Role::Server, 10)
+            );
+
+            let capped = Settings::default().max_window_bits(Role::Server, 12);
+            assert!(invalid_for("permessage-deflate", Some(capped)));
+            assert!(invalid_for("permessage-deflate; server_max_window_bits=13", Some(capped)));
+            assert_eq!(
+                response(Some("permessage-deflate; server_max_window_bits=12"), Some(capped))
+                    .unwrap(),
+                Some(capped)
+            );
+
+            // `client_max_window_bits` is never offered, at the default or under a local cap:
+            // any value a server may legally answer includes 8, which the encoder cannot build.
+            let capped_client = Settings::default().max_window_bits(Role::Client, 12);
+            for settings in [Settings::default(), capped_client] {
+                assert_eq!(settings.offer().to_str().unwrap(), "permessage-deflate");
+            }
+            // So every answer to it is unsolicited, in either form, whatever we capped locally.
+            for answer in [
+                "permessage-deflate; client_max_window_bits",
+                "permessage-deflate; client_max_window_bits=10",
+            ] {
+                assert!(invalid(answer));
+                assert!(invalid_for(answer, Some(capped_client)));
+            }
+            // ...and the local cap survives a bare response, since omitting the parameter
+            // declares no constraint and encoding narrower than 15 is inside it.
+            assert_eq!(
+                response(Some("permessage-deflate"), Some(capped_client)).unwrap(),
+                Some(capped_client),
+                "the configured cap stays on our own encoder"
+            );
+            // The sole-extension rule holds across repeated header fields, not just within one.
+            let mut headers = http::HeaderMap::new();
+            headers.append("Sec-WebSocket-Extensions", "x-example".parse().unwrap());
+            headers.append("Sec-WebSocket-Extensions", "permessage-deflate".parse().unwrap());
+            assert!(matches!(
+                Settings::default().accept_response(&headers),
+                Err(Error::Protocol(ProtocolError::InvalidHeader(_)))
+            ));
+        }
+
+        #[test]
+        fn client_rejects_competing_deflate_offer() {
+            use std::io::Cursor;
+
+            use super::super::ClientHandshake;
+            use crate::{error::ProtocolError, protocol::WebSocketConfig, Error};
+
+            let mut request = "ws://localhost/path".into_client_request().unwrap();
+            request.headers_mut().append(
+                "Sec-WebSocket-Extensions",
+                "x-example, permessage-deflate".parse().unwrap(),
+            );
+            let result = ClientHandshake::start(
+                Cursor::new(Vec::new()),
+                request,
+                Some(WebSocketConfig::default().enable_deflate()),
+            );
+            assert!(matches!(result, Err(Error::Protocol(ProtocolError::InvalidHeader(_)))));
+
+            let mut request = "ws://localhost/path".into_client_request().unwrap();
+            request.headers_mut().append(
+                "Sec-WebSocket-Extensions",
+                http::HeaderValue::from_bytes(b"PerMessage-Deflate; x=\x80").unwrap(),
+            );
+            let result = ClientHandshake::start(
+                Cursor::new(Vec::new()),
+                request,
+                Some(WebSocketConfig::default().enable_deflate()),
+            );
+            assert!(matches!(result, Err(Error::Protocol(ProtocolError::InvalidHeader(_)))));
+
+            // An unrelated extension is refused for the same reason as a competing one.
+            let mut request = "ws://localhost/path".into_client_request().unwrap();
+            request.headers_mut().append("Sec-WebSocket-Extensions", "x-example".parse().unwrap());
+            let result = ClientHandshake::start(
+                Cursor::new(Vec::new()),
+                request,
+                Some(WebSocketConfig::default().enable_deflate()),
+            );
+            assert!(matches!(result, Err(Error::Protocol(ProtocolError::InvalidHeader(_)))));
+
+            // Without the built-in offer the field is the embedder's, and start succeeds.
+            let mut request = "ws://localhost/path".into_client_request().unwrap();
+            request.headers_mut().append("Sec-WebSocket-Extensions", "x-example".parse().unwrap());
+            ClientHandshake::start(Cursor::new(Vec::new()), request, None)
+                .expect("an embedder keeps its own extension field when deflate is off");
+        }
+
+        #[test]
+        fn client_rejects_unoffered_deflate_response() {
+            use std::{io::Cursor, marker::PhantomData};
+
+            use super::super::{
+                super::machine::StageResult, ClientHandshake, HandshakeRole, VerifyData,
+            };
+            use crate::{error::ProtocolError, Error};
+
+            let accept_key = crate::handshake::derive_accept_key(b"dGhlIHNhbXBsZSBub25jZQ==");
+            let response = http::Response::builder()
                 .status(101)
                 .header("Connection", "Upgrade")
                 .header("Upgrade", "websocket")
-                .header("Sec-WebSocket-Accept", accept.clone());
-            if let Some(header) = header {
-                response = response.header("Sec-WebSocket-Extensions", header);
-            }
-            let response = verify.verify_response(response.body(None).unwrap())?;
-            verify.verify_deflate_response(&response, offered)
-        };
-        let response = |header: Option<&str>, offered: Option<Settings>| {
-            response_value(header.map(|value| value.parse().unwrap()), offered)
-        };
-        let invalid_for = |header, offered| {
-            // The compact API deliberately collapses every invalid PMD response
-            // to InvalidHeader. These rows pin acceptance and installed state,
-            // not the private parser route that produced the error.
-            matches!(
-                response(Some(header), offered),
-                Err(Error::Protocol(ProtocolError::InvalidHeader(_)))
-            )
-        };
-        let invalid = |header| invalid_for(header, Some(Settings::default()));
-
-        assert!(response(None, Some(Settings::default())).unwrap().is_none());
-        assert!(response(Some(""), Some(Settings::default())).unwrap().is_none());
-        assert!(invalid_for("permessage-deflate", None));
-        assert!(invalid_for("permessage-deflate; x=\"unterminated", None));
-        assert!(invalid_for("x-example; x=\"unterminated", None));
-        assert!(response_value(
-            Some(http::HeaderValue::from_bytes(b"x-example; x=\x80").unwrap()),
-            None
-        )
-        .unwrap()
-        .is_none());
-        assert!(matches!(
-            response_value(
-                Some(http::HeaderValue::from_bytes(b"permessage-deflate; x=\x80").unwrap()),
-                None
-            ),
-            Err(Error::Protocol(ProtocolError::InvalidHeader(_)))
-        ));
-        assert!(matches!(
-            response_value(
-                Some(
-                    http::HeaderValue::from_bytes(b"x-example; x=\x80, PerMessage-Deflate",)
-                        .unwrap(),
-                ),
-                Some(Settings::default())
-            ),
-            Err(Error::Protocol(ProtocolError::InvalidHeader(_)))
-        ));
-        assert_eq!(
-            response_value(
-                Some(http::HeaderValue::from_bytes(b"PerMessage-Deflate").unwrap()),
-                Some(Settings::default())
-            )
-            .unwrap(),
-            Some(Settings::default())
-        );
-        assert!(invalid(";x"));
-        assert!(invalid("permessage-deflate; client_max_window_bits"));
-        assert!(invalid("permessage-deflate; client_max_window_bits=09"));
-        assert!(invalid("permessage-deflate; client_max_window_bits=+9"));
-        assert!(invalid(
-            "permessage-deflate; client_max_window_bits=12; client_max_window_bits=12"
-        ));
-        let agreed = response(
-            Some("permessage-deflate; server_max_window_bits=8"),
-            Some(Settings::default()),
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(agreed, Settings { server_max_window_bits: 8, ..Settings::default() });
-        assert!(invalid_for(
-            "permessage-deflate",
-            Some(Settings::default().no_context_takeover(Role::Server, true))
-        ));
-        let agreed = response(
-            Some("permessage-deflate"),
-            Some(Settings::default().no_context_takeover(Role::Client, true)),
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(agreed, Settings::default().no_context_takeover(Role::Client, true));
-
-        let agreed = response(
-            Some("permessage-deflate; client_no_context_takeover"),
-            Some(Settings::default()),
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(agreed, Settings::default().no_context_takeover(Role::Client, true));
-
-        assert!(invalid("x-example; value=\"a,b;c\", permessage-deflate"));
-        // Quoted and escaped parameter values still parse; the value here is a server
-        // window, since a client window is no longer accepted in any form.
-        let agreed = response(
-            Some("permessage-deflate; server_no_context_takeover; server_max_window_bits=\"1\\0\""),
-            Some(Settings::default()),
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(
-            agreed,
-            Settings::default()
-                .no_context_takeover(Role::Server, true)
-                .max_window_bits(Role::Server, 10)
-        );
-
-        let capped = Settings::default().max_window_bits(Role::Server, 12);
-        assert!(invalid_for("permessage-deflate", Some(capped)));
-        assert!(invalid_for("permessage-deflate; server_max_window_bits=13", Some(capped)));
-        assert_eq!(
-            response(Some("permessage-deflate; server_max_window_bits=12"), Some(capped)).unwrap(),
-            Some(capped)
-        );
-
-        // `client_max_window_bits` is never offered, at the default or under a local cap:
-        // any value a server may legally answer includes 8, which the encoder cannot build.
-        let capped_client = Settings::default().max_window_bits(Role::Client, 12);
-        for settings in [Settings::default(), capped_client] {
-            assert_eq!(settings.offer().to_str().unwrap(), "permessage-deflate");
+                .header("Sec-WebSocket-Accept", accept_key.clone())
+                .header("Sec-WebSocket-Extensions", "permessage-deflate")
+                .body(None)
+                .unwrap();
+            let mut handshake = ClientHandshake {
+                verify_data: VerifyData { accept_key, subprotocols: None },
+                config: None,
+                _marker: PhantomData,
+            };
+            let result = handshake.stage_finished(StageResult::DoneReading {
+                stream: Cursor::new(Vec::new()),
+                result: response,
+                tail: Vec::new(),
+            });
+            assert!(matches!(result, Err(Error::Protocol(ProtocolError::InvalidHeader(_)))));
         }
-        // So every answer to it is unsolicited, in either form, whatever we capped locally.
-        for answer in [
-            "permessage-deflate; client_max_window_bits",
-            "permessage-deflate; client_max_window_bits=10",
-        ] {
-            assert!(invalid(answer));
-            assert!(invalid_for(answer, Some(capped_client)));
-        }
-        // ...and the local cap survives a bare response, since omitting the parameter
-        // declares no constraint and encoding narrower than 15 is inside it.
-        assert_eq!(
-            response(Some("permessage-deflate"), Some(capped_client)).unwrap(),
-            Some(capped_client),
-            "the configured cap stays on our own encoder"
-        );
-        // The sole-extension rule holds across repeated header fields, not just within one.
-        let mut headers = http::HeaderMap::new();
-        headers.append("Sec-WebSocket-Extensions", "x-example".parse().unwrap());
-        headers.append("Sec-WebSocket-Extensions", "permessage-deflate".parse().unwrap());
-        assert!(matches!(
-            Settings::default().accept_response(&headers),
-            Err(Error::Protocol(ProtocolError::InvalidHeader(_)))
-        ));
-    }
-
-    #[cfg(feature = "deflate")]
-    #[test]
-    fn client_rejects_competing_deflate_offer() {
-        use std::io::Cursor;
-
-        use super::ClientHandshake;
-        use crate::{error::ProtocolError, protocol::WebSocketConfig, Error};
-
-        let mut request = "ws://localhost/path".into_client_request().unwrap();
-        request
-            .headers_mut()
-            .append("Sec-WebSocket-Extensions", "x-example, permessage-deflate".parse().unwrap());
-        let result = ClientHandshake::start(
-            Cursor::new(Vec::new()),
-            request,
-            Some(WebSocketConfig::default().enable_deflate()),
-        );
-        assert!(matches!(result, Err(Error::Protocol(ProtocolError::InvalidHeader(_)))));
-
-        let mut request = "ws://localhost/path".into_client_request().unwrap();
-        request.headers_mut().append(
-            "Sec-WebSocket-Extensions",
-            http::HeaderValue::from_bytes(b"PerMessage-Deflate; x=\x80").unwrap(),
-        );
-        let result = ClientHandshake::start(
-            Cursor::new(Vec::new()),
-            request,
-            Some(WebSocketConfig::default().enable_deflate()),
-        );
-        assert!(matches!(result, Err(Error::Protocol(ProtocolError::InvalidHeader(_)))));
-
-        // An unrelated extension is refused for the same reason as a competing one.
-        let mut request = "ws://localhost/path".into_client_request().unwrap();
-        request.headers_mut().append("Sec-WebSocket-Extensions", "x-example".parse().unwrap());
-        let result = ClientHandshake::start(
-            Cursor::new(Vec::new()),
-            request,
-            Some(WebSocketConfig::default().enable_deflate()),
-        );
-        assert!(matches!(result, Err(Error::Protocol(ProtocolError::InvalidHeader(_)))));
-
-        // Without the built-in offer the field is the embedder's, and start succeeds.
-        let mut request = "ws://localhost/path".into_client_request().unwrap();
-        request.headers_mut().append("Sec-WebSocket-Extensions", "x-example".parse().unwrap());
-        ClientHandshake::start(Cursor::new(Vec::new()), request, None)
-            .expect("an embedder keeps its own extension field when deflate is off");
-    }
-
-    #[cfg(feature = "deflate")]
-    #[test]
-    fn client_rejects_unoffered_deflate_response() {
-        use std::{io::Cursor, marker::PhantomData};
-
-        use super::{super::machine::StageResult, ClientHandshake, HandshakeRole, VerifyData};
-        use crate::{error::ProtocolError, Error};
-
-        let accept_key = crate::handshake::derive_accept_key(b"dGhlIHNhbXBsZSBub25jZQ==");
-        let response = http::Response::builder()
-            .status(101)
-            .header("Connection", "Upgrade")
-            .header("Upgrade", "websocket")
-            .header("Sec-WebSocket-Accept", accept_key.clone())
-            .header("Sec-WebSocket-Extensions", "permessage-deflate")
-            .body(None)
-            .unwrap();
-        let mut handshake = ClientHandshake {
-            verify_data: VerifyData { accept_key, subprotocols: None },
-            config: None,
-            _marker: PhantomData,
-        };
-        let result = handshake.stage_finished(StageResult::DoneReading {
-            stream: Cursor::new(Vec::new()),
-            result: response,
-            tail: Vec::new(),
-        });
-        assert!(matches!(result, Err(Error::Protocol(ProtocolError::InvalidHeader(_)))));
     }
 
     #[test]
