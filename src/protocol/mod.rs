@@ -355,6 +355,15 @@ impl<Stream> WebSocket<Stream> {
     ///
     /// # Panics
     /// Panics if config is invalid e.g. `max_write_buffer_size <= write_buffer_size`.
+    ///
+    /// With the `deflate` feature, also panics if the callback changes deflate settings
+    /// the handshake has already agreed. Compression is negotiated once, and a connection
+    /// cannot move to different settings mid-stream.
+    ///
+    /// What survives a panic differs between the two builds, in one direction only. An
+    /// invalid configuration is committed before it is rejected, in both. With `deflate`
+    /// on the callback runs against a copy, so a panic raised *inside* the callback, or a
+    /// rejected deflate change, leaves the live configuration untouched.
     pub fn set_config(&mut self, set_func: impl FnOnce(&mut WebSocketConfig)) {
         self.context.set_config(set_func);
     }
@@ -2330,5 +2339,74 @@ mod tests {
             socket.read(),
             Err(Error::Capacity(CapacityError::MessageTooLong { size: 3, max_size: 2 }))
         ));
+    }
+
+    #[test]
+    fn set_config_changes_the_configuration() {
+        let mut socket =
+            WebSocket::from_raw_socket(WriteMoc(Cursor::new(Vec::<u8>::new())), Role::Client, None);
+        assert_eq!(socket.get_config().max_message_size, Some(64 << 20));
+
+        socket.set_config(|config| config.max_message_size = Some(1024));
+
+        assert_eq!(socket.get_config().max_message_size, Some(1024));
+    }
+
+    /// The feature-on arm applies the callback to a copy, so what survives a panic depends
+    /// on which panic it is. Validation still fires after the commit, as upstream does.
+    #[cfg(feature = "deflate")]
+    #[test]
+    fn set_config_panics_leave_the_live_config_in_a_defined_state() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        fn agreed_socket() -> WebSocket<WriteMoc<Cursor<Vec<u8>>>> {
+            WebSocket::from_raw_socket(
+                WriteMoc(Cursor::new(Vec::<u8>::new())),
+                Role::Client,
+                Some(WebSocketConfig::default().enable_deflate()),
+            )
+        }
+
+        let mut invalid = agreed_socket();
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            invalid.set_config(|config| config.max_write_buffer_size = config.write_buffer_size)
+        }));
+        assert!(outcome.is_err(), "an invalid candidate must still be rejected");
+        assert_eq!(
+            invalid.get_config().max_write_buffer_size,
+            invalid.get_config().write_buffer_size,
+            "upstream commits before validating, and the deflate arm keeps that ordering"
+        );
+
+        let mut callback = agreed_socket();
+        let untouched = callback.get_config().max_message_size;
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            callback.set_config(|config| {
+                config.max_message_size = Some(1);
+                panic!("the callback itself fails");
+            })
+        }));
+        assert!(outcome.is_err(), "the callback's own panic must propagate");
+        assert_eq!(
+            callback.get_config().max_message_size,
+            untouched,
+            "the candidate is discarded, so the callback's edit never lands"
+        );
+
+        // An agreed `Some(..)` moving to a different `Some(..)`. Starting from `None` also
+        // panics, while measuring that deflate cannot be switched on mid-connection --
+        // a different claim from the one this assert makes.
+        let mut agreed = agreed_socket();
+        let settled = agreed.get_config().deflate;
+        assert!(settled.is_some(), "the socket must start from an agreed Some(..)");
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            agreed.set_config(|config| *config = config.deflate_max_window_bits(Role::Client, 10))
+        }));
+        let message = *outcome
+            .expect_err("a deflate change must be rejected")
+            .downcast::<String>()
+            .expect("assert_eq! panics with a String");
+        assert!(message.contains("agreed deflate settings are immutable"), "{message}");
+        assert_eq!(agreed.get_config().deflate, settled, "rejection happens before the commit");
     }
 }
