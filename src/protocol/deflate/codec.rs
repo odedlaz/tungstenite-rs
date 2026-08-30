@@ -40,10 +40,9 @@ impl ConfiguredDecoder {
             Role::Client => settings.server_max_window_bits,
             Role::Server => settings.client_max_window_bits,
         };
-        // flate2 asserts window bits 9..=15 in both constructors; RFC 7692 permits a
-        // negotiated 8. Neither accept path bounds the peer window from below, so a
-        // conformant peer can hold us to 8 -- hence the clamp. Inflating with a wider
-        // window than the peer encoded with is always safe.
+        // flate2 asserts 9..=15 in both constructors and RFC 7692 permits a negotiated 8, which
+        // neither accept path bounds from below -- hence the clamp. Inflating wider than the
+        // peer encoded with is always safe.
         let window_bits = peer_window.max(9);
         Self { stream: Decompress::new_with_window_bits(false, window_bits), window_bits }
     }
@@ -242,14 +241,11 @@ mod tests {
         );
         assert_eq!(client.window_bits, 9, "an agreed 8 is stored as the constructible 9");
 
-        // `Decompress::reset` restores 15 whatever the stream was built with, so every
-        // narrower width has to be rebuilt and only 15 may keep the in-place path.
         for bits in 9..=14 {
             assert!(reconstructs_on_reset(bits), "a {bits}-bit decoder must be rebuilt");
         }
         assert!(!reconstructs_on_reset(15), "a 15-bit decoder keeps the in-place reset");
 
-        // The floored decoder still inflates what the peer encoded at its narrower window.
         let mut client = Context::new(
             Role::Client,
             Settings { server_max_window_bits: 8, ..Settings::default() },

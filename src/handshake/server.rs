@@ -594,8 +594,7 @@ mod tests {
 
         assert_eq!(response.unwrap(), "permessage-deflate");
         let agreed = config.deflate.expect("compression stays enabled");
-        // RFC 7692 §7.2.2: with no agreed client_max_window_bits the decoder window is
-        // 32 KiB, so the configured 11 must not survive into the runtime settings.
+        // RFC 7692 §7.2.2 makes the decoder 32 KiB here, so the configured 11 must not survive.
         assert_eq!(agreed.client_max_window_bits, 15);
     }
 
@@ -619,8 +618,7 @@ mod tests {
             (config.deflate, response)
         }
 
-        // The fourth offer is the first that permits binding, so it outranks the two
-        // full-window alternatives ahead of it and the narrower one behind it.
+        // Offer four is the first that can bind -- two full-window ahead, one narrower behind.
         let (agreed, response) = accept(
             11,
             &[
@@ -639,20 +637,17 @@ mod tests {
         assert!(agreed.client_no_context_takeover);
         assert_eq!(agreed.client_max_window_bits, 11);
 
-        // With nothing to bind, the retained fallback is the first one seen, not the last.
         let (agreed, response) =
             accept(11, &["permessage-deflate", "permessage-deflate; server_no_context_takeover"]);
         assert_eq!(response.unwrap(), "permessage-deflate");
         assert_eq!(agreed.unwrap().client_max_window_bits, 15);
 
-        // At the default cap there is nothing to prefer, so the first acceptable offer
-        // wins even though the second would have bound the peer.
+        // At cap 15 nothing outranks anything, so the first wins though the second would bind.
         let (agreed, response) =
             accept(15, &["permessage-deflate", "permessage-deflate; client_max_window_bits=10"]);
         assert_eq!(response.unwrap(), "permessage-deflate");
         assert_eq!(agreed.unwrap().client_max_window_bits, 15);
 
-        // A named parameter is still capped, in both its forms and from both sides.
         for (offer, expected) in [
             ("permessage-deflate; client_max_window_bits", 11),
             ("permessage-deflate; client_max_window_bits=12", 11),
