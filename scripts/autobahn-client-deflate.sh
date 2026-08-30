@@ -4,6 +4,10 @@
 # A sibling of autobahn-client.sh rather than a flag on it, for the reason the examples are
 # siblings: the feature-off arm keeps measuring a byte-identical object.
 # No `set -x`: the canonical JSON values below are ~84 KiB each and xtrace would print both.
+#
+# The supervisor below is duplicated in autobahn-server-deflate.sh rather than shared. A common
+# library would be a third file and this round is scoped to these two scripts; the duplication
+# is deliberate and should be collapsed only together with the sibling examples.
 set -euo pipefail
 SOURCE_DIR=$(readlink -f "${BASH_SOURCE[0]}")
 SOURCE_DIR=$(dirname "$SOURCE_DIR")
@@ -15,32 +19,63 @@ IMAGE_DIGEST='sha256:519915fb568b04c9383f70a1c405ae3ff44ab9e35835b085239c258b6fa
 IMAGE_CONFIG_DIGEST='sha256:b0475418d42ae284876bd695f0282fbe6684e00f745d787b095d60e55727a06f'
 IMAGE="crossbario/autobahn-testsuite@${IMAGE_DIGEST}"
 ORACLE='autobahn/expected-results-deflate.json'
-RESULTS='autobahn/client/index.json'
+RESULTS_DIR='autobahn/client'
+RESULTS="${RESULTS_DIR}/index.json"
 SPEC='autobahn/fuzzingserver.json'
 READY_TIMEOUT_SECONDS=30
 
 RUN_DIR=''
 TESTER_CID_FILE=''
 CONTAINER_ID=''
+WORKLOAD_PID=''
+CLEANUP_STATUS=0
+PENDING_SIGNAL=''
+
+function cleanup_failed() {
+    echo "cleanup: could not $1" >&2
+    CLEANUP_STATUS=75
+}
+
 function cleanup() {
-    # One line on purpose: `local` is a command, so declaring first would overwrite `$?`.
-    # TERM and INT supply their own status: a signal to this PID alone, during a command
-    # that then succeeds, leaves `$?` at zero, and `${1:-$?}` is what keeps EXIT unaffected.
-    local status=${1:-$?}
+    # Every caller passes the status, EXIT included, so `$?` is never read here: reading it
+    # inside the function makes it the status of whatever the caller last evaluated, which for
+    # a call inside an `if` is the condition. Absent means unknown, and unknown fails closed.
+    local status=${1:-1}
     trap - TERM INT EXIT
     # From docker's own write, not the assignment below: a signal during `docker create`
     # would never reach it and would leave a container nothing owns.
     if [ -z "${CONTAINER_ID}" ] && [ -n "${TESTER_CID_FILE}" ]; then
         CONTAINER_ID=$(cat "${TESTER_CID_FILE}" 2>/dev/null || true)
     fi
+    if [ -n "${WORKLOAD_PID}" ]; then
+        if kill "${WORKLOAD_PID}" 2>/dev/null; then
+            wait "${WORKLOAD_PID}" 2>/dev/null || true
+            echo "cleanup: client child ${WORKLOAD_PID} signalled and reaped"
+        elif kill -0 "${WORKLOAD_PID}" 2>/dev/null; then
+            cleanup_failed "signal client child ${WORKLOAD_PID}, which is still alive"
+        else
+            echo "cleanup: client child ${WORKLOAD_PID} had already exited"
+        fi
+    fi
     if [ -n "${CONTAINER_ID}" ]; then
-        docker container stop "${CONTAINER_ID}" >/dev/null 2>&1 || true
-        # Emitted before removal, from the one site every path reaches: `--rm` would have
-        # erased exactly this on the exit-137 path.
-        docker container inspect "${CONTAINER_ID}" \
-            --format 'tester: terminal ExitCode={{.State.ExitCode}} OOMKilled={{.State.OOMKilled}}' \
-            2>/dev/null || true
-        docker container rm "${CONTAINER_ID}" >/dev/null 2>&1 || true
+        docker container stop "${CONTAINER_ID}" >/dev/null 2>&1 ||
+            cleanup_failed "stop tester ${CONTAINER_ID}"
+        # The terminal state is the only postmortem an exit 137 can be diagnosed from, and
+        # `--rm` would have erased it. If reading it fails the container is deliberately kept:
+        # removing it here would destroy the evidence this block exists to capture.
+        if docker container inspect "${CONTAINER_ID}" \
+            --format 'tester: terminal ExitCode={{.State.ExitCode}} OOMKilled={{.State.OOMKilled}}'
+        then
+            docker container rm "${CONTAINER_ID}" >/dev/null 2>&1 ||
+                cleanup_failed "remove tester ${CONTAINER_ID}"
+        else
+            cleanup_failed "inspect tester ${CONTAINER_ID}; container retained as the postmortem"
+        fi
+    fi
+    # A run whose cleanup cannot account for its own resources has not earned a pass, whatever
+    # the case verdicts said. An existing failure is kept: it is the more specific cause.
+    if [ "${CLEANUP_STATUS}" -ne 0 ] && [ "${status}" -eq 0 ]; then
+        status=${CLEANUP_STATUS}
     fi
     if [ -n "${RUN_DIR}" ]; then
         if [ "${status}" -eq 0 ]; then
@@ -53,7 +88,23 @@ function cleanup() {
 }
 trap 'cleanup 143' TERM
 trap 'cleanup 130' INT
-trap cleanup EXIT
+trap 'cleanup $?' EXIT
+
+# Bash runs a pending trap between commands, so a signal arriving between `&` and the `$!` that
+# records the PID would reach a cleanup that cannot see the child it just created. Inside the
+# window the handler only records; `resume_signals` re-arms and then acts on whatever arrived.
+function defer_signals() {
+    trap 'PENDING_SIGNAL=143' TERM
+    trap 'PENDING_SIGNAL=130' INT
+}
+
+function resume_signals() {
+    trap 'cleanup 143' TERM
+    trap 'cleanup 130' INT
+    if [ -n "${PENDING_SIGNAL}" ]; then
+        cleanup "${PENDING_SIGNAL}"
+    fi
+}
 
 function verify_image() {
     # Asked of the registry, so it checks the pin itself and not whatever the local store
@@ -119,7 +170,34 @@ function await_tester_ready() {
     exit 67
 }
 
+# The server role refuses to grade unless its tester exited 0. This is that gate for a role whose
+# tester is a long-lived server instead of a run-to-completion client: the question is not what it
+# exited with but whether it was still alive to serve the suite it is about to be graded on.
+# Without it the only thing standing between a dead tester and a verdict is an `.unwrap()` in the
+# example -- upstream code, not a guard this harness owns.
+function assert_tester_survived() {
+    local state
+    state=$(docker container inspect "${CONTAINER_ID}" \
+        --format '{{.State.Running}} {{.State.ExitCode}} {{.State.OOMKilled}}' 2>/dev/null || true)
+    if [ -z "${state}" ]; then
+        echo "tester ${CONTAINER_ID} could not be inspected after the suite; refusing to grade" >&2
+        exit 68
+    fi
+    if [ "${state%% *}" != 'true' ]; then
+        echo "tester ${CONTAINER_ID} did not survive the suite" \
+             "(Running ExitCode OOMKilled: ${state}); refusing to grade" >&2
+        exit 68
+    fi
+    echo "tester: alive after the suite (Running ExitCode OOMKilled: ${state})"
+}
+
 function verify_index() {
+    # The directory was refused if it pre-existed, so an index here was produced by this run.
+    # Its absence means the workload never wrote one, which is not something to grade.
+    if [ ! -s "${RESULTS}" ]; then
+        echo "${RESULTS} was not produced by this run." >&2
+        exit 64
+    fi
     if ! jq -e 'has("Tungstenite")' "${RESULTS}" >/dev/null; then
         echo 'Result index is unparseable or names no Tungstenite agent.' >&2
         exit 64
@@ -147,6 +225,14 @@ function test_diff() {
     fi
     echo "oracle: exact match on $(jq -r '.Tungstenite | keys | length' "${ORACLE}") cases"
 }
+
+# Refused, not deleted: a pre-existing directory is prior evidence and this run has no standing
+# to destroy it. Refusing is also what makes freshness unrepresentable rather than merely
+# unchecked -- an index present at grading time can only have come from this run.
+if [ -e "${RESULTS_DIR}" ]; then
+    echo "${RESULTS_DIR} already exists; archive or remove it before running" >&2
+    exit 71
+fi
 
 verify_image
 resolve_endpoint
@@ -176,9 +262,24 @@ echo "tester: container ${CONTAINER_ID}"
 
 await_tester_ready
 
+# Backgrounded and waited rather than run in the foreground. Bash defers a trapped signal until
+# a foreground external command returns, so a hung suite would sit past the outer 30-minute
+# bound and reach SIGKILL with the trap never having run. `wait` is interruptible.
 echo 'role: client starting'
-cargo run --release --features deflate --example autobahn-client-deflate
+defer_signals
+cargo run --release --features deflate --example autobahn-client-deflate &
+WORKLOAD_PID=$!
+resume_signals
+
+CLIENT_STATUS=0
+wait "${WORKLOAD_PID}" || CLIENT_STATUS=$?
+WORKLOAD_PID=''
+if [ "${CLIENT_STATUS}" -ne 0 ]; then
+    echo "client example exited ${CLIENT_STATUS}" >&2
+    exit "${CLIENT_STATUS}"
+fi
 echo 'role: client example exited 0'
 
+assert_tester_survived
 verify_index
 test_diff
