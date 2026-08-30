@@ -15,6 +15,9 @@ use tungstenite::{
     Message, Result,
 };
 
+/// Emitted after the listener binds. Harness synchronization, never a protocol result.
+const READY_MARKER: &str = "autobahn-server-deflate: listening on";
+
 fn must_not_block<Role: HandshakeRole>(err: HandshakeError<Role>) -> Error {
     match err {
         HandshakeError::Interrupted(_) => panic!("Bug: blocking socket would block"),
@@ -40,6 +43,9 @@ fn main() {
     env_logger::init();
 
     let server = TcpListener::bind("127.0.0.1:9002").unwrap();
+    // Not a log record: `env_logger` would drop it unless `RUST_LOG` were set. Stdout is
+    // line-buffered, so the newline publishes it.
+    println!("{READY_MARKER} {}", server.local_addr().unwrap());
 
     for stream in server.incoming() {
         spawn(move || match stream {
