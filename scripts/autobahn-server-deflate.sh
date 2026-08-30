@@ -102,14 +102,24 @@ function cleanup() {
         fi
     fi
     if [ -n "${SERVER_PID}" ]; then
+        # `wait` holds the only authoritative status for this child, and nothing outside the
+        # script can recover it: a wrapper is the script's parent, not the listener's. Recorded
+        # on both terminating paths and never folded into the script's own status -- an expected
+        # cleanup kill must not overwrite the workload result that brought us here.
+        local server_status=0
         if kill "${SERVER_PID}" 2>/dev/null; then
             # Reaped, not merely signalled, so the script never outlives the listener it owns.
-            wait "${SERVER_PID}" 2>/dev/null || true
-            echo "cleanup: server child ${SERVER_PID} signalled and reaped"
+            wait "${SERVER_PID}" 2>/dev/null || server_status=$?
+            echo "cleanup: server child ${SERVER_PID} signalled and reaped," \
+                 "wait status ${server_status}"
         elif kill -0 "${SERVER_PID}" 2>/dev/null; then
             cleanup_failed "signal server child ${SERVER_PID}, which is still alive"
         else
-            echo "cleanup: server child ${SERVER_PID} had already exited"
+            # The informative case: a child that died on its own is still waitable, so its real
+            # exit code survives here. Without this the crash path reports no status at all.
+            wait "${SERVER_PID}" 2>/dev/null || server_status=$?
+            echo "cleanup: server child ${SERVER_PID} had already exited," \
+                 "wait status ${server_status}"
         fi
     fi
     # A run whose cleanup cannot account for its own resources has not earned a pass, whatever
