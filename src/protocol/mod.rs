@@ -1219,8 +1219,7 @@ mod incoming {
     }
 }
 
-#[cfg(feature = "deflate")]
-#[cfg(test)]
+#[cfg(all(test, feature = "deflate"))]
 mod rfc_7692_section_6_1 {
     use super::{incoming::Incoming, *};
     use crate::error::ProtocolError;
@@ -1289,8 +1288,7 @@ mod rfc_7692_section_6_1 {
     }
 }
 
-#[cfg(feature = "deflate")]
-#[cfg(test)]
+#[cfg(all(test, feature = "deflate"))]
 mod codec_state_ownership {
     use super::{incoming::Incoming, *};
     use crate::error::ProtocolError;
@@ -1842,8 +1840,7 @@ mod codec_state_ownership {
     }
 }
 
-#[cfg(feature = "deflate")]
-#[cfg(test)]
+#[cfg(all(test, feature = "deflate"))]
 mod write_transaction {
     use super::*;
     use crate::Message;
