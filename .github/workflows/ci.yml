@@ -53,8 +53,8 @@ jobs:
       - name: Test
         run: cargo test --release
 
-      - name: Test deflate without default features
-        run: cargo test --no-default-features --features deflate
+      - name: Test all features
+        run: cargo test --all-features
 
       - name: Check documentation
         env:
