@@ -18,7 +18,7 @@ include = ["benches/**/*", "src/**/*", "examples/**/*", "LICENSE-*", "README.md"
 all-features = true
 
 [features]
-default = ["handshake"]
+default = ["handshake", "deflate"]
 handshake = ["data-encoding", "http", "httparse", "sha1"]
 deflate = ["handshake", "dep:flate2"]
 url = ["dep:url"]

@@ -72,10 +72,11 @@ Choose the one that is appropriate for your needs.
 By default **no TLS feature is activated**, so make sure you use one of the TLS features,
 otherwise you won't be able to communicate with the TLS endpoints.
 
-The `deflate` feature is separate from the TLS choice above and adds opt-in
-permessage-deflate support; enable it with or without a TLS feature. Compression remains
-disabled for each connection until it is enabled and configured through the
-`WebSocketConfig` deflate methods.
+The `deflate` feature is enabled by default and compiles in permessage-deflate support;
+build without it using `default-features = false, features = ["handshake"]`. It is
+independent of the TLS choice above, and compiling it in changes nothing on its own:
+compression stays disabled for each connection until it is enabled and configured through
+the `WebSocketConfig` deflate methods.
 
 Testing
 -------
