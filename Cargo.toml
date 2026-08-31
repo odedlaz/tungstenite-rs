@@ -112,14 +112,6 @@ name = "autobahn-server"
 required-features = ["handshake"]
 
 [[example]]
-name = "autobahn-client-deflate"
-required-features = ["deflate"]
-
-[[example]]
-name = "autobahn-server-deflate"
-required-features = ["deflate"]
-
-[[example]]
 name = "callback-error"
 required-features = ["handshake"]
 
