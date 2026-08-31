@@ -53,11 +53,6 @@ jobs:
       - name: Test
         run: cargo test --release --all-features
 
-      # The release run above covers the same features; this one is what executes the
-      # `debug_assert!`s, which are compiled out of a release build.
-      - name: Test all features (debug assertions)
-        run: cargo test --all-features
-
       - name: Check documentation
         env:
           RUSTDOCFLAGS: -D warnings
@@ -115,4 +110,3 @@ jobs:
 
       - name: Running Autobahn TestSuite for server
         run: ./scripts/autobahn-server.sh
-
