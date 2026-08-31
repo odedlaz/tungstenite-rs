@@ -269,7 +269,7 @@ await_tester_ready
 # bound and reach SIGKILL with the trap never having run. `wait` is interruptible.
 echo 'role: client starting'
 defer_signals
-cargo run --release --features deflate --example autobahn-client-deflate &
+cargo run --locked --release --features deflate --example autobahn-client-deflate &
 WORKLOAD_PID=$!
 resume_signals
 

@@ -286,7 +286,10 @@ function resolve_server_bin() {
     local build_json
     # Synchronous and outside the readiness bound, so a slow cold build cannot read as a
     # slow bind. Only stdout is captured; cargo's progress still goes to the terminal.
-    build_json=$(cargo build --release --features deflate \
+    # `--locked` so the resolution recorded around this role is the one it builds against:
+    # the lock is not committed and flate2 is range-resolved, so an unlocked build could
+    # silently pick a different version than the one the run reports.
+    build_json=$(cargo build --locked --release --features deflate \
         --example autobahn-server-deflate --message-format=json)
     local executables
     executables=$(printf '%s\n' "${build_json}" |
