@@ -53,6 +53,14 @@ jobs:
       - name: Test
         run: cargo test --release
 
+      - name: Test all features
+        run: cargo test --all-features
+
+      - name: Check documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --all-features --no-deps
+
   test-msvr:
     name: Test MSRV
     runs-on: ubuntu-latest
