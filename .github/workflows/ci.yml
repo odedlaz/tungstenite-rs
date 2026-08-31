@@ -51,9 +51,11 @@ jobs:
         run: cargo hack check --feature-powerset --all-targets
 
       - name: Test
-        run: cargo test --release
+        run: cargo test --release --all-features
 
-      - name: Test all features
+      # The release run above covers the same features; this one is what executes the
+      # `debug_assert!`s, which are compiled out of a release build.
+      - name: Test all features (debug assertions)
         run: cargo test --all-features
 
       - name: Check documentation
