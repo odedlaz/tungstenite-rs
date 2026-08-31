@@ -496,8 +496,8 @@ mod tests {
             assert_eq!(agreed, Settings::default().no_context_takeover(Role::Client, true));
 
             assert!(invalid("x-example; value=\"a,b;c\", permessage-deflate"));
-            // Quoted and escaped parameter values still parse; the value here is a server
-            // window, since a client window is no longer accepted in any form.
+            // Quoted and escaped parameter values still parse: the quoted pair `\0` stands
+            // for the character `0`, so `"1\0"` is the two digits of a 10-bit window.
             let agreed = response(
                 Some("permessage-deflate; server_no_context_takeover; server_max_window_bits=\"1\\0\""),
                 Some(Settings::default()),
@@ -548,6 +548,14 @@ mod tests {
                     "permessage-deflate; client_max_window_bits=8",
                     Some(settings)
                 ));
+            }
+            // The parser's range is the only rejection below 8, where flate2 would panic.
+            for answer in [
+                "permessage-deflate; client_max_window_bits=0",
+                "permessage-deflate; client_max_window_bits=7",
+                "permessage-deflate; client_max_window_bits=16",
+            ] {
+                assert!(invalid(answer), "{answer} selects a width outside 8..=15");
             }
             // A response omitting the parameter declares no constraint, so the cap stands.
             assert_eq!(

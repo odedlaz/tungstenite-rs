@@ -31,8 +31,8 @@ pub(super) fn accept_response(settings: Settings, headers: &HeaderMap) -> Result
             match parse(extension)? {
                 Extension::Empty => {}
                 Extension::Deflate(params) if selected.is_none() => selected = Some(params),
-                // The offer named permessage-deflate alone, so anything else here was
-                // never requested, and this socket has no codec to honour it with.
+                // permessage-deflate is the only extension token the offer names, so another
+                // name here was never requested and a second instance has no second codec.
                 Extension::Deflate(_) | Extension::Other => return Err(invalid_header()),
             }
         }
