@@ -113,3 +113,105 @@ jobs:
 
       - name: Running Autobahn TestSuite for server
         run: ./scripts/autobahn-server.sh
+
+  autobahn-deflate:
+    name: Autobahn tests (permessage-deflate)
+    runs-on: ubuntu-latest
+    # A hang detector, not a capacity claim.
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: stable
+
+      # Which tree produced the result is part of the result. `push` and `pull_request` run this
+      # same workflow at different commits -- the latter on GitHub's synthetic merge ref -- so the
+      # checked-out SHA is recorded beside the event rather than inferred from it.
+      - name: Record run identity
+        run: |
+          echo "event=${{ github.event_name }}"
+          echo "run_id=${{ github.run_id }} run_attempt=${{ github.run_attempt }}"
+          echo "github_sha=${{ github.sha }}"
+          echo "checked_out_sha=$(git rev-parse HEAD)"
+          echo "pr_head_sha=${{ github.event.pull_request.head.sha }}"
+          echo "pr_base_sha=${{ github.event.pull_request.base.sha }}"
+
+      # Both role templates were proven only under BSD; the authoring host has no GNU coreutils.
+      # This is the other half, run before any role so a rejected template fails as itself rather
+      # than as a role that could not create a directory.
+      - name: Verify GNU mktemp templates
+        run: |
+          client_dir=$(mktemp -d "${TMPDIR:-/tmp}/autobahn-client-deflate.XXXXXX")
+          server_dir=$(mktemp -d "${TMPDIR:-/tmp}/autobahn-server-deflate.XXXXXX")
+          test -d "${client_dir}"
+          test -d "${server_dir}"
+          echo "gnu-mktemp: created ${client_dir} and ${server_dir}"
+          rmdir "${client_dir}" "${server_dir}"
+
+      # `Cargo.lock` is not committed and flate2 is range-resolved, so a run must say which
+      # resolution it measured. The checksum is read from the lock because `cargo metadata`
+      # carries no such field. Exactly three lines: a second flate2 or a missing one fails here
+      # rather than diffing away later.
+      - name: Record dependency resolution (preflight)
+        run: |
+          cargo generate-lockfile
+          sha256sum Cargo.lock | cut -d ' ' -f 1 > "${RUNNER_TEMP}/dep-identity.txt"
+          cargo metadata --locked --features deflate --format-version 1 |
+            jq -r '.packages[] | select(.name == "flate2") | "\(.version) \(.source)"' \
+            >> "${RUNNER_TEMP}/dep-identity.txt"
+          sed -n '/^name = "flate2"$/,/^$/ s/^checksum = "\(.*\)"$/\1/p' Cargo.lock \
+            >> "${RUNNER_TEMP}/dep-identity.txt"
+          test "$(wc -l < "${RUNNER_TEMP}/dep-identity.txt")" -eq 3
+          echo 'dependency identity (preflight):'
+          cat "${RUNNER_TEMP}/dep-identity.txt"
+
+      # The client runs first, matching the existing feature-off job. Each role captures a natural
+      # shell status and emits one terminal line carrying it. A missing line means the step died
+      # before the shell could record anything: incomplete evidence, never an inferred pass.
+      - name: Autobahn client role
+        shell: bash {0}
+        run: |
+          rc=0
+          ./scripts/autobahn-client-deflate.sh || rc=$?
+          echo "ci-role: client rc=${rc}"
+          exit "${rc}"
+
+      - name: Require unchanged dependency resolution (between roles)
+        run: |
+          sha256sum Cargo.lock | cut -d ' ' -f 1 > "${RUNNER_TEMP}/dep-between.txt"
+          cargo metadata --locked --features deflate --format-version 1 |
+            jq -r '.packages[] | select(.name == "flate2") | "\(.version) \(.source)"' \
+            >> "${RUNNER_TEMP}/dep-between.txt"
+          sed -n '/^name = "flate2"$/,/^$/ s/^checksum = "\(.*\)"$/\1/p' Cargo.lock \
+            >> "${RUNNER_TEMP}/dep-between.txt"
+          diff "${RUNNER_TEMP}/dep-identity.txt" "${RUNNER_TEMP}/dep-between.txt"
+          echo 'dependency identity unchanged after the client role'
+
+      - name: Autobahn server role
+        shell: bash {0}
+        run: |
+          rc=0
+          ./scripts/autobahn-server-deflate.sh || rc=$?
+          echo "ci-role: server rc=${rc}"
+          exit "${rc}"
+
+      # Runs after a failed role so the resolution is on record for the postmortem too. It cannot
+      # turn the job green: an earlier failed step has already decided that.
+      - name: Require unchanged dependency resolution (postflight)
+        if: always()
+        run: |
+          sha256sum Cargo.lock | cut -d ' ' -f 1 > "${RUNNER_TEMP}/dep-post.txt"
+          cargo metadata --locked --features deflate --format-version 1 |
+            jq -r '.packages[] | select(.name == "flate2") | "\(.version) \(.source)"' \
+            >> "${RUNNER_TEMP}/dep-post.txt"
+          sed -n '/^name = "flate2"$/,/^$/ s/^checksum = "\(.*\)"$/\1/p' Cargo.lock \
+            >> "${RUNNER_TEMP}/dep-post.txt"
+          diff "${RUNNER_TEMP}/dep-identity.txt" "${RUNNER_TEMP}/dep-post.txt"
+          echo 'dependency identity unchanged at postflight'
