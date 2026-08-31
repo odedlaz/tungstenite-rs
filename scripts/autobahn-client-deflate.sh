@@ -244,6 +244,8 @@ fi
 
 # An explicit `XXXXXX` template (`mktemp -t <name>` is BSD-only), giving the cidfile a path
 # that does not exist yet, which `docker create` requires -- it refuses to clobber one.
+# The assignment stays bare. `local` and `declare` supply their own exit status, so `set -e`
+# would never see a rejected template and the run would continue with an empty `RUN_DIR`.
 RUN_DIR=$(mktemp -d "${TMPDIR:-/tmp}/autobahn-client-deflate.XXXXXX")
 TESTER_CID_FILE="${RUN_DIR}/tester.cid"
 

@@ -103,9 +103,11 @@ function cleanup() {
     fi
     if [ -n "${SERVER_PID}" ]; then
         # `wait` holds the only authoritative status for this child, and nothing outside the
-        # script can recover it: a wrapper is the script's parent, not the listener's. Recorded
-        # on both terminating paths and never folded into the script's own status -- an expected
-        # cleanup kill must not overwrite the workload result that brought us here.
+        # script can recover it: a wrapper is the script's parent, not the listener's. Which
+        # branch reaped it decides whether it counts. A status cleanup itself provoked must not
+        # overwrite the workload result that brought us here; one from a child that died
+        # unprompted is the run's own failure, and under direct CI no wrapper remains to
+        # adjudicate it.
         local server_status=0
         if kill "${SERVER_PID}" 2>/dev/null; then
             # Reaped, not merely signalled, so the script never outlives the listener it owns.
@@ -120,6 +122,10 @@ function cleanup() {
             wait "${SERVER_PID}" 2>/dev/null || server_status=$?
             echo "cleanup: server child ${SERVER_PID} had already exited," \
                  "wait status ${server_status}"
+            # An existing failure is kept: it is the more specific cause.
+            if [ "${server_status}" -ne 0 ] && [ "${status}" -eq 0 ]; then
+                status=${server_status}
+            fi
         fi
     fi
     # A run whose cleanup cannot account for its own resources has not earned a pass, whatever
@@ -309,6 +315,8 @@ echo "server: launching ${SERVER_BIN}"
 
 # One owned directory: an explicit `XXXXXX` template because `mktemp -t <name>` is BSD-only,
 # and it gives the cidfile a path that does not exist yet, which `docker create` requires.
+# The assignment stays bare. `local` and `declare` supply their own exit status, so `set -e`
+# would never see a rejected template and the run would continue with an empty `RUN_DIR`.
 RUN_DIR=$(mktemp -d "${TMPDIR:-/tmp}/autobahn-server-deflate.XXXXXX")
 SERVER_LOG="${RUN_DIR}/server.log"
 TESTER_CID_FILE="${RUN_DIR}/tester.cid"
