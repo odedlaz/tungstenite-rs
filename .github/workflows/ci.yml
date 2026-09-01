@@ -51,10 +51,7 @@ jobs:
         run: cargo hack check --feature-powerset --all-targets
 
       - name: Test
-        run: cargo test --release
-
-      - name: Test all features
-        run: cargo test --all-features
+        run: cargo test --release --all-features
 
       - name: Check documentation
         env:
