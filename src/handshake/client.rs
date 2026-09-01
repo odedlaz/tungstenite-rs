@@ -496,8 +496,8 @@ mod tests {
             assert_eq!(agreed, Settings::default().no_context_takeover(Role::Client, true));
 
             assert!(invalid("x-example; value=\"a,b;c\", permessage-deflate"));
-            // Quoted and escaped parameter values still parse; the value here is a server
-            // window, since a client window is no longer accepted in any form.
+            // Quoted and escaped parameter values still parse: the quoted pair `\0` stands
+            // for the character `0`, so `"1\0"` is the two digits of a 10-bit window.
             let agreed = response(
                 Some("permessage-deflate; server_no_context_takeover; server_max_window_bits=\"1\\0\""),
                 Some(Settings::default()),
@@ -520,22 +520,44 @@ mod tests {
                 Some(capped)
             );
 
-            // `client_max_window_bits` is never offered, at the default or under a local cap:
-            // any value a server may legally answer includes 8, which the encoder cannot build.
+            // The offer always names `client_max_window_bits`, and never with the configured
+            // cap: that cap bounds our own encoder, not what the peer may reserve to decode.
             let capped_client = Settings::default().max_window_bits(Role::Client, 12);
             for settings in [Settings::default(), capped_client] {
-                assert_eq!(settings.offer().to_str().unwrap(), "permessage-deflate");
+                assert_eq!(
+                    settings.offer().to_str().unwrap(),
+                    "permessage-deflate; client_max_window_bits"
+                );
             }
-            // So every answer to it is unsolicited, in either form, whatever we capped locally.
+            // Having invited a selection, honour it -- downwards only, so a server narrows
+            // our encoder and can never widen it past what was configured.
+            for (configured, selected, agreed) in [(15, 9, 9), (15, 15, 15), (9, 15, 9), (12, 9, 9)]
+            {
+                let offered = Settings::default().max_window_bits(Role::Client, configured);
+                let answer = format!("permessage-deflate; client_max_window_bits={selected}");
+                assert_eq!(
+                    response(Some(&answer), Some(offered)).unwrap(),
+                    Some(Settings::default().max_window_bits(Role::Client, agreed)),
+                    "a cap of {configured} against a selected {selected} agrees on {agreed}"
+                );
+            }
+            // RFC 7692 §7.1.2.2 lets a server select 8; flate2 builds no compressor that
+            // narrow, and encoding at 9 would exceed what the server agreed to decode.
+            for settings in [Settings::default(), capped_client] {
+                assert!(invalid_for(
+                    "permessage-deflate; client_max_window_bits=8",
+                    Some(settings)
+                ));
+            }
+            // The parser's range is the only rejection below 8, where flate2 would panic.
             for answer in [
-                "permessage-deflate; client_max_window_bits",
-                "permessage-deflate; client_max_window_bits=10",
+                "permessage-deflate; client_max_window_bits=0",
+                "permessage-deflate; client_max_window_bits=7",
+                "permessage-deflate; client_max_window_bits=16",
             ] {
-                assert!(invalid(answer));
-                assert!(invalid_for(answer, Some(capped_client)));
+                assert!(invalid(answer), "{answer} selects a width outside 8..=15");
             }
-            // ...and the local cap survives a bare response, since omitting the parameter
-            // declares no constraint and encoding narrower than 15 is inside it.
+            // A response omitting the parameter declares no constraint, so the cap stands.
             assert_eq!(
                 response(Some("permessage-deflate"), Some(capped_client)).unwrap(),
                 Some(capped_client),
