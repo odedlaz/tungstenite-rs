@@ -16,9 +16,11 @@ pub(super) fn offer(settings: Settings) -> HeaderValue {
     if settings.server_max_window_bits < 15 {
         value.push_str(&format!("; server_max_window_bits={}", settings.server_max_window_bits));
     }
-    // Deliberately omitted: RFC 7692 §7.1.2.2 makes an offered client_max_window_bits a
-    // maximum, so naming any value invites a server answer of 8 — which flate2 cannot
-    // encode (it asserts 9..=15). The configured client cap stays local to our encoder.
+    // Valueless rather than the configured cap: that cap bounds our own encoder and is
+    // applied to whatever the server selects, so naming it here would put a promise on the
+    // wire without changing the window we compress with. RFC 7692 §7.1.2.2 gives the bare
+    // form exactly that meaning -- support for a selection, with no hint attached.
+    value.push_str("; client_max_window_bits");
     HeaderValue::from_str(&value).expect("the generated extension offer is valid")
 }
 
@@ -29,8 +31,8 @@ pub(super) fn accept_response(settings: Settings, headers: &HeaderMap) -> Result
             match parse(extension)? {
                 Extension::Empty => {}
                 Extension::Deflate(params) if selected.is_none() => selected = Some(params),
-                // The offer named permessage-deflate alone, so anything else here was
-                // never requested, and this socket has no codec to honour it with.
+                // permessage-deflate is the only extension token the offer names, so another
+                // name here was never requested and a second instance has no second codec.
                 Extension::Deflate(_) | Extension::Other => return Err(invalid_header()),
             }
         }
@@ -50,10 +52,19 @@ pub(super) fn accept_response(settings: Settings, headers: &HeaderMap) -> Result
         None if settings.server_max_window_bits < 15 => return Err(invalid_header()),
         None => {}
     }
-    // RFC 7692 permits client_max_window_bits in a response only when the offer
-    // included it. This client never does, so reject the unsolicited parameter.
-    if !matches!(params.client_max_window_bits, ClientWindow::Absent) {
-        return Err(invalid_header());
+    // The offer invited a selection, so RFC 7692 §7.1.2.2 governs every shape of answer: a
+    // value limits the window we compress with, and absence means the server can decode a
+    // full 32 KiB, which the configured cap is never above.
+    match params.client_max_window_bits {
+        // flate2 builds compressors only for 9..=15, and clamping up to 9 would encode
+        // wider than the server just agreed to decode.
+        ClientWindow::Bits(8) => return Err(invalid_header()),
+        ClientWindow::Bits(bits) => {
+            agreed.client_max_window_bits = bits.min(settings.client_max_window_bits);
+        }
+        // Only an offer may go bare; a response must carry a decimal value.
+        ClientWindow::NoValue => return Err(invalid_header()),
+        ClientWindow::Absent => {}
     }
     Ok(Some(agreed))
 }
@@ -89,8 +100,8 @@ fn accept_offer(settings: Settings, offer: Params) -> Option<(Settings, HeaderVa
     let server_window = match offer.server_max_window_bits {
         // This is our own encoder's window, and an offered 8 would reach `Compress`, which
         // asserts 9..=15. Refuse the offer; clamping to 9 would compress with a wider
-        // window than the client asked for. The client side has no twin for this any more:
-        // its offer omits the parameter, so `accept_response` rejects every answer to it.
+        // window than the client asked for. `accept_response` refuses a selected 8 for the
+        // same reason, on the window this endpoint would then encode with.
         Some(8) => return None,
         Some(bits) => Some(bits.min(settings.server_max_window_bits)),
         None if settings.server_max_window_bits < 15 => Some(settings.server_max_window_bits),

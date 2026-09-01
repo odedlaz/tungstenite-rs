@@ -126,6 +126,11 @@ impl WebSocketConfig {
     /// handshake settles on, and a peer that declines leaves the connection
     /// uncompressed.
     ///
+    /// The client offer carries `client_max_window_bits` with no value, so a server may
+    /// select the window this endpoint compresses with; see [`deflate_max_window_bits`].
+    ///
+    /// [`deflate_max_window_bits`]: WebSocketConfig::deflate_max_window_bits
+    ///
     /// [`accept_deflate_offers`]: WebSocketConfig::accept_deflate_offers
     #[cfg(feature = "deflate")]
     pub fn enable_deflate(mut self) -> Self {
@@ -155,8 +160,13 @@ impl WebSocketConfig {
     ///   [`accept_deflate_offers`] prefers an offer the cap can bind when a client sends
     ///   more than one.
     ///
-    /// A client's own cap is local only: it is not advertised, so the peer must still be
-    /// able to decode a 15-bit client window whatever we encode with.
+    /// A client's own cap is a ceiling rather than a request: the offer names
+    /// `client_max_window_bits` without a value, so a server may select this endpoint's
+    /// window, and a selection narrows the cap instead of raising it. A selected 8 fails the
+    /// handshake — the compressor has no window below 9, and encoding at 9 would exceed what
+    /// the server agreed to decode. RFC 7692 §7.1.2.2 reads a response that omits the
+    /// parameter as a 32,768-byte peer decoder, so the cap then stands as configured and the
+    /// peer must decode whatever we encode with.
     ///
     /// [`accept_deflate_offers`]: WebSocketConfig::accept_deflate_offers
     ///
